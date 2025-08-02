@@ -4,6 +4,14 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.8.5] – 2025-08-04
+### Fixed
+- **Offline catalogue** – `/v1/models` now scans *all* plausible HuggingFace
+  cache roots (`HF_HOME`, `XDG_CACHE_HOME`, `~/.cache`, `/root/.cache`,
+  `/.cache`) so every locally-downloaded model is listed.
+- Graceful 400 response preserved for requests that ask for a model not
+  present in the cache when `LOCAL_ONLY_MODELS=1`.
+
 ## [1.8.3] – 2025-08-03
 ### Added
 - **Model catalogue overhaul** – `GET /v1/models` now  
