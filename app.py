@@ -1,24 +1,28 @@
 """
-WhisperX Transcription API · v1.8.3
+WhisperX Transcription API · v1.8.5
 (OpenAI-compatible)
 
-•  GPU-only wrapper around WhisperX with optional alignment & diarisation
-•  One model instance per GPU, thread-safe, TTL-based eviction
-•  Detailed logging: freeVRAM and used=±MB on load/unload, step timings
-•  `/v1/models` now lists **all** Faster-Whisper variants when online and
-   only cached ones in offline mode, plus a \"downloaded\" flag
-•  TF32 permanently disabled for reproducibility
+•  GPU-only WhisperX wrapper with optional alignment & diarisation
+•  One GPU instance per model, thread-safe, TTL-based eviction
+•  Detailed logging (freeVRAM, used=±MB, step timings)
+•  `/v1/models`
+      – online:  every Faster-Whisper variant + "downloaded" flag
+      – offline: only variants that truly exist on disk
+•  Offline mode now returns HTTP 400 when the requested model isn’t cached
+•  TF32 permanently disabled (reproducibility)
 """
 
-# ─────────  CUDA (TF32 OFF)  ─────────
+# ───────── CUDA / TF32 OFF ─────────
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Any
+
 import whisperx, srt, webvtt
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+from huggingface_hub.errors import LocalEntryNotFoundError
 from urllib.parse import quote_plus
 
 logging.basicConfig(level=logging.INFO,
@@ -40,7 +44,7 @@ async def run_sync(func, *a, **kw):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(EXECUTOR, lambda: func(*a, **kw))
 
-# ─────────  Faster-Whisper variants  ─────────
+# ───────── Faster-Whisper catalogue ─────────
 _MODELS = {
     "tiny.en":          "Systran/faster-whisper-tiny.en",
     "tiny":             "Systran/faster-whisper-tiny",
@@ -61,29 +65,44 @@ _MODELS = {
     "large-v3-turbo":   "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     "turbo":            "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
-WHISPER_MODELS = list(_MODELS.keys())
 
-def _repo_path(repo: str) -> Path:
-    org, name = repo.split("/", 1)
-    hub_root = Path(os.getenv("HF_HOME", Path.home() / ".cache/huggingface/hub"))
-    return hub_root / f"models--{org}--{quote_plus(name)}"
+# ───────── Cache-scan helpers ─────────
+def _cache_roots() -> list[Path]:
+    """Return every plausible HF cache directory that exists."""
+    roots: set[Path] = set()
+    if "HF_HOME" in os.environ:
+        roots.add(Path(os.environ["HF_HOME"]))
+    if "XDG_CACHE_HOME" in os.environ:
+        roots.add(Path(os.environ["XDG_CACHE_HOME"]) / "huggingface" / "hub")
+    roots.update({
+        Path.home() / ".cache/huggingface/hub",
+        Path("/root/.cache/huggingface/hub"),
+        Path("/.cache/huggingface/hub"),
+    })
+    return [r for r in roots if r.exists()]
 
 def local_sizes() -> list[str]:
-    """Model ids already present on disk (regardless of VRAM)."""
-    return [mid for mid, repo in _MODELS.items() if _repo_path(repo).exists()]
+    """Return model IDs whose snapshot exists under any cache root."""
+    cached: list[str] = []
+    for mid, repo in _MODELS.items():
+        org, name = repo.split("/", 1)
+        fragment = f"models--{org}--{quote_plus(name)}"
+        if any((root / fragment).exists() for root in _cache_roots()):
+            cached.append(mid)
+    return cached
 
-# ─────────  Environment  ─────────
+# ───────── Runtime flags ─────────
 OFFLINE  = os.getenv("LOCAL_ONLY_MODELS", "0") == "1"
 TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-app = FastAPI(title="WhisperX Transcription API", version="1.8.3")
+app = FastAPI(title="WhisperX Transcription API", version="1.8.5")
 
-# ─────────  TTL caches  ─────────
+# ───────── TTL caches ─────────
 class TTLCache(dict):
-    """Dict with TTL eviction & GPU-memory logging."""
+    """Dict with TTL eviction & VRAM-usage logging."""
     def __init__(self, label: str): super().__init__(); self.label = label
     def get(self, k):
         v = super().get(k)
@@ -101,7 +120,7 @@ class TTLCache(dict):
 W_CACHE, A_CACHE, D_CACHE = TTLCache("whisper"), TTLCache("align"), TTLCache("diarize")
 LOCKS: Dict[str, threading.Lock] = {}
 
-# ─────────  Logging helpers  ─────────
+# ───────── Logging helpers ─────────
 from pathlib import Path
 def _log(tag: str, fname: str, msg: str = "", *a):
     logging.info("[%s] %s  freeVRAM=%d MB " + msg,
@@ -117,23 +136,35 @@ def _load_end(lbl: str, key: str, before: int):
                  lbl, "model" if lbl == "whisper" else "lang",
                  key, delta, free_mb())
 
-# ─────────  Loaders  ─────────
+# ───────── Loaders ─────────
 def load_whisper(model_id: str):
-    model = W_CACHE.get(model_id)
-    if not model:
-        before = free_mb(); _load_start("whisper", model_id)
-        kwargs = dict(compute_type=COMPUTE_TYPE,
-                      local_files_only=OFFLINE,
-                      device=DEVICE)
-        if FW_THREADS:
-            kwargs["threads"] = FW_THREADS
-        model = whisperx.load_model(model_id, **kwargs)
-        W_CACHE.put(model_id, model); _load_end("whisper", model_id, before)
-    if model_id not in LOCKS:
-        LOCKS[model_id] = threading.Lock()
+    """Return (pipeline, lock); raise 400 offline if model isn’t cached."""
+    existing = W_CACHE.get(model_id)
+    if existing:
+        if model_id not in LOCKS:
+            LOCKS[model_id] = threading.Lock()
+        return existing, LOCKS[model_id]
+
+    before = free_mb(); _load_start("whisper", model_id)
+    kw = dict(compute_type=COMPUTE_TYPE,
+              local_files_only=OFFLINE,
+              device=DEVICE)
+    if FW_THREADS:
+        kw["threads"] = FW_THREADS
+    try:
+        model = whisperx.load_model(model_id, **kw)
+    except LocalEntryNotFoundError:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Model '{model_id}' is not cached locally and "
+                    "LOCAL_ONLY_MODELS=1 prevents downloading.")
+        ) from None
+
+    W_CACHE.put(model_id, model); _load_end("whisper", model_id, before)
+    LOCKS[model_id] = threading.Lock()
     return model, LOCKS[model_id]
 
-def load_align(lang):
+def load_align(lang: str):
     key = lang or "default"
     pair = A_CACHE.get(key)
     if pair: return pair
@@ -152,26 +183,21 @@ def load_diar():
     D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
     return pip
 
-# ─────────  Cache helper  ─────────
+# ───────── /v1/models ─────────
 def is_cached(mid: str) -> bool:
-    """True if model is on disk or currently in VRAM cache."""
     return mid in local_sizes() or mid in W_CACHE
 
-# ─────────  /v1/models  ─────────
 @app.get("/v1/models")
 def models():
     ids = (m for m in _MODELS) if not OFFLINE else (m for m in _MODELS if is_cached(m))
-    return {"data": [{
-        "id": m,
-        "object": "model",
-        "created": 0,
-        "owned_by": "you",
-        "downloaded": is_cached(m)
-    } for m in ids]}
+    return {"data": [
+        {"id": m, "object": "model", "created": 0, "owned_by": "you",
+         "downloaded": is_cached(m)}
+        for m in ids
+    ]}
 
-# ─────────  Text helpers  ─────────
+# ───────── Text helpers ─────────
 def _tagged(seg):
-    """Insert [SPK_n] when speaker changes."""
     out, cur = [], None
     for s in seg:
         if s.get("speaker") != cur:
@@ -181,7 +207,6 @@ def _tagged(seg):
     return " ".join(out).strip()
 
 def standardize(raw, spk=False):
-    """Unified result dict {text, segments, language}."""
     if isinstance(raw, dict) and "segments" in raw:
         seg = raw["segments"]
         txt = _tagged(seg) if spk else raw.get("text") or " ".join(s["text"].strip() for s in seg)
@@ -208,21 +233,21 @@ def vtt_from(seg):
             text=(f"[{s['speaker']}] " if s.get("speaker") else "") + s["text"].strip()))
     return v.content
 
-# ─────────  Sweeper thread  ─────────
+# ───────── Sweeper thread ─────────
 def _sweep():
     while True:
         time.sleep(60)
         W_CACHE.sweep(TTL_SEC); A_CACHE.sweep(TTL_SEC); D_CACHE.sweep(TTL_SEC); gc.collect()
 threading.Thread(target=_sweep, daemon=True).start()
 
-# ─────────  Pipeline  ─────────
+# ───────── Pipeline ─────────
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     fname = Path(path).name
     wav = whisperx.load_audio(path)
     audio_sec = len(wav) / 16000
     t0 = time.perf_counter()
 
-    # 1. transcription
+    # transcription
     _log("transcribe_start", fname, "model=%s", model)
     whisper, lock = load_whisper(model)
     await run_sync(lock.acquire)
@@ -233,7 +258,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     res = standardize(raw)
     _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-    # 2. alignment
+    # alignment
     if do_align:
         t = time.perf_counter(); lang_used = res.get("language") or lang
         _log("align_start", fname, "lang=%s", lang_used)
@@ -242,7 +267,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
             whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
         _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-    # 3. diarisation
+    # diarisation
     if do_diar:
         t = time.perf_counter(); _log("diarize_start", fname)
         spk = await run_sync(load_diar(), wav, **diar_kw)
@@ -255,7 +280,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
                  fname, wall, audio_sec, audio_sec / wall if wall else 0)
     return res
 
-# ─────────  KW builders  ─────────
+# ───────── KW builders ─────────
 def build_transcribe_kwargs(batch, beam, best, patience, length_penalty,
                             word_ts, vad, vad_thr):
     kw = {"batch_size": batch or BATCH_SIZE}
@@ -284,7 +309,7 @@ def _fmt(res, fmt):
     if fmt == "verbose_json": return JSONResponse(res)
     return JSONResponse({"text": text})
 
-# ─────────  Endpoints  ─────────
+# ───────── Endpoints ─────────
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
