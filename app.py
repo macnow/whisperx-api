@@ -1,15 +1,13 @@
 """
-WhisperX Transcription API · v1.8.2-en
+WhisperX Transcription API · v1.8.3
 (OpenAI-compatible)
 
-Key points
-──────────
-•  Faster-Whisper models (all official & distil/turbo variants).
-•  One GPU instance per model – thread-safe with per-model lock.
-•  Detailed logging: freeVRAM, used=±MB on load/unload, step timings.
-•  Optional alignment + diarisation. Speaker tags appear as [SPK_n].
-•  Offline mode via LOCAL_ONLY_MODELS=1 (relies on local_files_only).
-•  TF32 permanently disabled for reproducibility.
+•  GPU-only wrapper around WhisperX with optional alignment & diarisation
+•  One model instance per GPU, thread-safe, TTL-based eviction
+•  Detailed logging: freeVRAM and used=±MB on load/unload, step timings
+•  `/v1/models` now lists **all** Faster-Whisper variants when online and
+   only cached ones in offline mode, plus a \"downloaded\" flag
+•  TF32 permanently disabled for reproducibility
 """
 
 # ─────────  CUDA (TF32 OFF)  ─────────
@@ -19,35 +17,30 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Any
 import whisperx, srt, webvtt
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, PlainTextResponse
 from urllib.parse import quote_plus
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)8s  %(message)s",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)8s  %(message)s")
 
-# Disable TF32 once and for all
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 assert torch.cuda.is_available(), "CUDA GPU required"
 
 DEVICE, COMPUTE_TYPE, BATCH_SIZE = "cuda", "float16", 16
 EXECUTOR   = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_THREADS", "4")))
-FW_THREADS = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ do not pass
+FW_THREADS = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ not forwarded
 
 _MB = 1024 * 1024
 def free_mb() -> int:
-    """Return free global GPU memory (MiB)."""
     return torch.cuda.mem_get_info()[0] // _MB
 
 async def run_sync(func, *a, **kw):
-    """Run blocking code in a thread without blocking the event-loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(EXECUTOR, lambda: func(*a, **kw))
 
-# ─────────  Model list  ─────────
+# ─────────  Faster-Whisper variants  ─────────
 _MODELS = {
     "tiny.en":          "Systran/faster-whisper-tiny.en",
     "tiny":             "Systran/faster-whisper-tiny",
@@ -71,27 +64,26 @@ _MODELS = {
 WHISPER_MODELS = list(_MODELS.keys())
 
 def _repo_path(repo: str) -> Path:
-    """Return local HF cache path for a given repo name."""
     org, name = repo.split("/", 1)
-    root = Path(os.getenv("HF_HOME", Path.home() / ".cache/huggingface/hub"))
-    return root / f"models--{org}--{quote_plus(name)}"
+    hub_root = Path(os.getenv("HF_HOME", Path.home() / ".cache/huggingface/hub"))
+    return hub_root / f"models--{org}--{quote_plus(name)}"
 
 def local_sizes() -> list[str]:
-    """Return model IDs that already exist in the local HF cache."""
-    return [m for m, r in _MODELS.items() if _repo_path(r).exists()]
+    """Model ids already present on disk (regardless of VRAM)."""
+    return [mid for mid, repo in _MODELS.items() if _repo_path(repo).exists()]
 
-# ─────────  Environment config  ─────────
+# ─────────  Environment  ─────────
 OFFLINE  = os.getenv("LOCAL_ONLY_MODELS", "0") == "1"
 TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-app = FastAPI(title="WhisperX Transcription API", version="1.8.2-en")
+app = FastAPI(title="WhisperX Transcription API", version="1.8.3")
 
 # ─────────  TTL caches  ─────────
 class TTLCache(dict):
-    """Dictionary with TTL eviction plus GPU-memory logging."""
+    """Dict with TTL eviction & GPU-memory logging."""
     def __init__(self, label: str): super().__init__(); self.label = label
     def get(self, k):
         v = super().get(k)
@@ -102,47 +94,44 @@ class TTLCache(dict):
         for k, (_, ts) in list(self.items()):
             if now - ts > ttl:
                 del self[k]; torch.cuda.empty_cache()
-                key_name = {"whisper": "model",
-                            "align": "lang",
-                            "diarize": "pipeline"}[self.label]
+                key = {"whisper": "model", "align": "lang", "diarize": "pipeline"}[self.label]
                 logging.info("[%s_model_unload]  %s=%s  freeVRAM=%d MB",
-                             self.label, key_name, k, free_mb())
+                             self.label, key, k, free_mb())
 
-W_CACHE = TTLCache("whisper")
-A_CACHE = TTLCache("align")
-D_CACHE = TTLCache("diarize")
+W_CACHE, A_CACHE, D_CACHE = TTLCache("whisper"), TTLCache("align"), TTLCache("diarize")
 LOCKS: Dict[str, threading.Lock] = {}
 
 # ─────────  Logging helpers  ─────────
-def _log(label: str, fname: str, msg: str = "", *a):
+from pathlib import Path
+def _log(tag: str, fname: str, msg: str = "", *a):
     logging.info("[%s] %s  freeVRAM=%d MB " + msg,
-                 label, Path(fname).name, free_mb(), *a)
+                 tag, Path(fname).name, free_mb(), *a)
 
 def _load_start(lbl: str, key: str):
     logging.info("[%s_model_load_start]  %s=%s  freeVRAM=%d MB",
                  lbl, "model" if lbl == "whisper" else "lang", key, free_mb())
 
 def _load_end(lbl: str, key: str, before: int):
-    used = before - free_mb()
+    delta = before - free_mb()
     logging.info("[%s_model_load_end]    %s=%s  used=%+d MB  freeVRAM=%d MB",
                  lbl, "model" if lbl == "whisper" else "lang",
-                 key, used, free_mb())
+                 key, delta, free_mb())
 
 # ─────────  Loaders  ─────────
-def load_whisper(model_name: str):
-    model = W_CACHE.get(model_name)
+def load_whisper(model_id: str):
+    model = W_CACHE.get(model_id)
     if not model:
-        before = free_mb(); _load_start("whisper", model_name)
+        before = free_mb(); _load_start("whisper", model_id)
         kwargs = dict(compute_type=COMPUTE_TYPE,
                       local_files_only=OFFLINE,
                       device=DEVICE)
         if FW_THREADS:
             kwargs["threads"] = FW_THREADS
-        model = whisperx.load_model(model_name, **kwargs)
-        W_CACHE.put(model_name, model); _load_end("whisper", model_name, before)
-    if model_name not in LOCKS:
-        LOCKS[model_name] = threading.Lock()
-    return model, LOCKS[model_name]
+        model = whisperx.load_model(model_id, **kwargs)
+        W_CACHE.put(model_id, model); _load_end("whisper", model_id, before)
+    if model_id not in LOCKS:
+        LOCKS[model_id] = threading.Lock()
+    return model, LOCKS[model_id]
 
 def load_align(lang):
     key = lang or "default"
@@ -163,9 +152,26 @@ def load_diar():
     D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
     return pip
 
+# ─────────  Cache helper  ─────────
+def is_cached(mid: str) -> bool:
+    """True if model is on disk or currently in VRAM cache."""
+    return mid in local_sizes() or mid in W_CACHE
+
+# ─────────  /v1/models  ─────────
+@app.get("/v1/models")
+def models():
+    ids = (m for m in _MODELS) if not OFFLINE else (m for m in _MODELS if is_cached(m))
+    return {"data": [{
+        "id": m,
+        "object": "model",
+        "created": 0,
+        "owned_by": "you",
+        "downloaded": is_cached(m)
+    } for m in ids]}
+
 # ─────────  Text helpers  ─────────
 def _tagged(seg):
-    """Insert [SPK_n] markers when speaker changes."""
+    """Insert [SPK_n] when speaker changes."""
     out, cur = [], None
     for s in seg:
         if s.get("speaker") != cur:
@@ -175,11 +181,10 @@ def _tagged(seg):
     return " ".join(out).strip()
 
 def standardize(raw, spk=False):
-    """Convert WhisperX output to a consistent dict structure."""
+    """Unified result dict {text, segments, language}."""
     if isinstance(raw, dict) and "segments" in raw:
         seg = raw["segments"]
-        txt = _tagged(seg) if spk else raw.get("text") or \
-              " ".join(s["text"].strip() for s in seg)
+        txt = _tagged(seg) if spk else raw.get("text") or " ".join(s["text"].strip() for s in seg)
         return {"text": txt, "segments": seg, "language": raw.get("language")}
     if isinstance(raw, list):
         txt = _tagged(raw) if spk else " ".join(s["text"].strip() for s in raw)
@@ -187,49 +192,37 @@ def standardize(raw, spk=False):
     return {"text": "", "segments": [], "language": None}
 
 def srt_from(seg):
-    return srt.compose([
-        srt.Subtitle(i + 1,
-                     timedelta(seconds=s["start"]),
-                     timedelta(seconds=s["end"]),
-                     (f"[{s['speaker']}] " if s.get("speaker") else "") +
-                     s["text"].strip())
-        for i, s in enumerate(seg)
-    ])
+    return srt.compose([srt.Subtitle(i+1,
+                                     timedelta(seconds=s["start"]),
+                                     timedelta(seconds=s["end"]),
+                                     (f"[{s['speaker']}] " if s.get("speaker") else "") +
+                                     s["text"].strip())
+                        for i, s in enumerate(seg)])
 
 def vtt_from(seg):
     v = webvtt.WebVTT()
     for s in seg:
-        txt = (f"[{s['speaker']}] " if s.get("speaker") else "") + s["text"].strip()
-        v.captions.append(
-            webvtt.Caption(start=webvtt.Caption.time_to_webvtt(s["start"]),
-                           end=webvtt.Caption.time_to_webvtt(s["end"]),
-                           text=txt)
-        )
+        v.captions.append(webvtt.Caption(
+            start=webvtt.Caption.time_to_webvtt(s["start"]),
+            end  =webvtt.Caption.time_to_webvtt(s["end"]),
+            text=(f"[{s['speaker']}] " if s.get("speaker") else "") + s["text"].strip()))
     return v.content
 
-# ─────────  Sweeper  ─────────
+# ─────────  Sweeper thread  ─────────
 def _sweep():
-    """Background thread: evict models that exceeded TTL."""
     while True:
         time.sleep(60)
-        W_CACHE.sweep(TTL_SEC)
-        A_CACHE.sweep(TTL_SEC)
-        D_CACHE.sweep(TTL_SEC)
-        gc.collect()
-
+        W_CACHE.sweep(TTL_SEC); A_CACHE.sweep(TTL_SEC); D_CACHE.sweep(TTL_SEC); gc.collect()
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ─────────  Pipeline  ─────────
-async def process(path, model, lang, do_align, do_diar,
-                  trans_kw: Dict[str, Any],
-                  diar_kw: Dict[str, Any]):
-    """Run full pipeline and return standardised output."""
+async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     fname = Path(path).name
     wav = whisperx.load_audio(path)
     audio_sec = len(wav) / 16000
     t0 = time.perf_counter()
 
-    # 1) Transcription
+    # 1. transcription
     _log("transcribe_start", fname, "model=%s", model)
     whisper, lock = load_whisper(model)
     await run_sync(lock.acquire)
@@ -240,33 +233,29 @@ async def process(path, model, lang, do_align, do_diar,
     res = standardize(raw)
     _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-    # 2) Alignment
+    # 2. alignment
     if do_align:
-        t = time.perf_counter()
-        lang_used = res.get("language") or lang
+        t = time.perf_counter(); lang_used = res.get("language") or lang
         _log("align_start", fname, "lang=%s", lang_used)
         model_a, meta = load_align(lang_used)
         res = standardize(await run_sync(
             whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
         _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-    # 3) Diarisation
+    # 3. diarisation
     if do_diar:
-        t = time.perf_counter()
-        _log("diarize_start", fname)
+        t = time.perf_counter(); _log("diarize_start", fname)
         spk = await run_sync(load_diar(), wav, **diar_kw)
         res = standardize(await run_sync(
             whisperx.assign_word_speakers, spk, res), spk=True)
         _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
     wall = time.perf_counter() - t0
-    logging.info(
-        "[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
-        fname, wall, audio_sec, audio_sec / wall if wall else 0,
-    )
+    logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
+                 fname, wall, audio_sec, audio_sec / wall if wall else 0)
     return res
 
-# ─────────  Builder helpers  ─────────
+# ─────────  KW builders  ─────────
 def build_transcribe_kwargs(batch, beam, best, patience, length_penalty,
                             word_ts, vad, vad_thr):
     kw = {"batch_size": batch or BATCH_SIZE}
@@ -278,25 +267,24 @@ def build_transcribe_kwargs(batch, beam, best, patience, length_penalty,
         kw["vad_filter"] = True
         if vad_thr:
             kw["vad_parameters"] = {"threshold": vad_thr}
-    if word_ts:
-        kw["word_timestamps"] = True
+    if word_ts: kw["word_timestamps"] = True
     return kw
 
 def build_diar_kwargs(min_spk, max_spk):
-    kwargs = {}
-    if min_spk: kwargs["min_speakers"] = min_spk
-    if max_spk: kwargs["max_speakers"] = max_spk
-    return kwargs
+    d = {}
+    if min_spk: d["min_speakers"] = min_spk
+    if max_spk: d["max_speakers"] = max_spk
+    return d
 
 def _fmt(res, fmt):
     text, seg = res["text"], res["segments"]
-    if fmt == "text":  return PlainTextResponse(text)
-    if fmt == "srt":   return PlainTextResponse(srt_from(seg), media_type="text/srt")
-    if fmt == "vtt":   return PlainTextResponse(vtt_from(seg), media_type="text/vtt")
+    if fmt == "text": return PlainTextResponse(text)
+    if fmt == "srt":  return PlainTextResponse(srt_from(seg), media_type="text/srt")
+    if fmt == "vtt":  return PlainTextResponse(vtt_from(seg), media_type="text/vtt")
     if fmt == "verbose_json": return JSONResponse(res)
     return JSONResponse({"text": text})
 
-# ─────────  FastAPI endpoints  ─────────
+# ─────────  Endpoints  ─────────
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
@@ -359,9 +347,3 @@ async def translations(
         return _fmt(res, response_format)
     finally:
         os.remove(tmp.name)
-
-@app.get("/v1/models")
-def models():
-    sizes = sorted(set(local_sizes() + list(W_CACHE.keys())))
-    return {"data": [{"id": s, "object": "model", "created": 0, "owned_by": "you"}
-                     for s in sizes]}
