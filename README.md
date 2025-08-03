@@ -62,6 +62,9 @@ volumes:
 | `FASTER_WHISPER_THREADS` | `0` | Value forwarded to Faster‑Whisper `threads` (0 = not passed). |
 | `HF_TOKEN` | — | HF access token for private diarisation models. |
 | `LOCAL_ONLY_MODELS` | `0` | `1` → forbid downloads, fail if model not cached. |
+| `WARMUP_MODEL` | `large-v3` | Whisper model ID to preload on startup. |
+| `WARMUP_ALIGN_LANGS` | `en` | Comma-separated list of language codes to preload alignment models for. |
+| `WARMUP_DIARIZE` | `0` | `1` → preload the diarization model. |
 | `HF_HOME`, `XDG_CACHE_HOME` | — | Override HuggingFace cache location. |
 
 ⚠️ **TF32 is disabled globally** for reproducibility.
