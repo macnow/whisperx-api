@@ -15,6 +15,7 @@ WhisperX Transcription API · v1.8.5
 # ───────── CUDA / TF32 OFF ─────────
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
@@ -93,6 +94,13 @@ class ResponseFormat(str, Enum):
     SRT = "srt"
     VTT = "vtt"
     VERBOSE_JSON = "verbose_json"
+
+@dataclass(frozen=True)
+class WhisperKwargs:
+    beam_size: int | None
+    best_of: int | None
+    patience: float | None
+    length_penalty: float | None
 
 # ───────── Cache-scan helpers ─────────
 def _cache_roots() -> list[Path]:
@@ -174,22 +182,39 @@ def _load_end(lbl: str, key: str, before: int):
                  key, delta, free_mb())
 
 # ───────── Loaders ─────────
-def load_whisper(model_id: str):
+def load_whisper(model_id: str, kwargs: WhisperKwargs):
     """Return (pipeline, lock); raise 400 offline if model isn’t cached."""
-    existing = W_CACHE.get(model_id)
+    cache_key = (model_id, kwargs)
+    lock_key = str(cache_key)
+    existing = W_CACHE.get(cache_key)
     if existing:
-        if model_id not in LOCKS:
-            LOCKS[model_id] = threading.Lock()
-        return existing, LOCKS[model_id]
+        if lock_key not in LOCKS:
+            LOCKS[lock_key] = threading.Lock()
+        return existing, LOCKS[lock_key]
 
-    before = free_mb(); _load_start("whisper", model_id)
-    kw = dict(compute_type=COMPUTE_TYPE,
-              local_files_only=OFFLINE,
-              device=DEVICE)
+    log_key = f"{model_id} beam={kwargs.beam_size} pat={kwargs.patience}"
+    before = free_mb(); _load_start("whisper", log_key)
+
+    load_kw = dict(
+        compute_type=COMPUTE_TYPE,
+        local_files_only=OFFLINE,
+        device=DEVICE,
+    )
+
+    if kwargs.beam_size and kwargs.beam_size > 0:
+        load_kw["beam_size"] = kwargs.beam_size
+    if kwargs.patience and kwargs.patience > 0.0:
+        load_kw["patience"] = kwargs.patience
+    if kwargs.length_penalty and kwargs.length_penalty > 0.0:
+        load_kw["length_penalty"] = kwargs.length_penalty
+    if kwargs.best_of and kwargs.best_of > 0:
+        load_kw["best_of"] = kwargs.best_of
+
     if FW_THREADS:
-        kw["threads"] = FW_THREADS
+        load_kw["threads"] = FW_THREADS
+
     try:
-        model = whisperx.load_model(model_id, **kw)
+        model = whisperx.load_model(model_id, **load_kw)
     except LocalEntryNotFoundError:
         raise HTTPException(
             status_code=400,
@@ -197,9 +222,9 @@ def load_whisper(model_id: str):
                     "LOCAL_ONLY_MODELS=1 prevents downloading.")
         ) from None
 
-    W_CACHE.put(model_id, model); _load_end("whisper", model_id, before)
-    LOCKS[model_id] = threading.Lock()
-    return model, LOCKS[model_id]
+    W_CACHE.put(cache_key, model); _load_end("whisper", log_key, before)
+    LOCKS[lock_key] = threading.Lock()
+    return model, LOCKS[lock_key]
 
 def load_align(lang: str):
     key = lang or "default"
@@ -227,7 +252,7 @@ def warmup():
     if WARMUP_MODEL not in _MODELS:
         logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
         return
-    load_whisper(WARMUP_MODEL)
+    load_whisper(WARMUP_MODEL, WhisperKwargs(beam_size=0, best_of=0, patience=0.0, length_penalty=0.0))
     for lang in WARMUP_ALIGN_LANGS:
         if lang: load_align(lang)
     if WARMUP_DIARIZE:
@@ -292,7 +317,9 @@ def _sweep():
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
-async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
+async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw,
+                  beam_size: int | None, best_of: int | None,
+                  patience: float | None, length_penalty: float | None):
     fname = Path(path).name
     try:
         wav = whisperx.load_audio(path)
@@ -306,7 +333,9 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     try:
         # transcription
         _log("transcribe_start", fname, "model=%s", model)
-        whisper, lock = load_whisper(model)
+        whisper_kwargs = WhisperKwargs(beam_size=beam_size, best_of=best_of,
+                                       patience=patience, length_penalty=length_penalty)
+        whisper, lock = load_whisper(model, whisper_kwargs)
         await run_sync(lock.acquire)
         try:
             raw = await run_sync(whisper.transcribe, wav, **trans_kw)
@@ -342,13 +371,8 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     return res
 
 # ───────── KW builders ─────────
-def build_transcribe_kwargs(batch, beam, best, patience, length_penalty,
-                            word_ts, vad, vad_thr):
+def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
     kw = {"batch_size": batch or BATCH_SIZE}
-    if beam: kw["beam_size"] = beam
-    if best: kw["best_of"] = best
-    if patience: kw["patience"] = patience
-    if length_penalty: kw["length_penalty"] = length_penalty
     if vad:
         kw["vad_filter"] = True
         if vad_thr:
@@ -409,11 +433,12 @@ async def transcriptions(
         res = await process(
             tmp.name, params["model"], language, params["align"], params["diarize"],
             build_transcribe_kwargs(
-                params["batch_size"], params["beam_size"], params["best_of"],
-                params["patience"], params["length_penalty"],
+                params["batch_size"],
                 params["word_timestamps"], params["vad_filter"],
                 params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+            params["beam_size"], params["best_of"], params["patience"],
+            params["length_penalty"])
         return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
@@ -428,9 +453,10 @@ async def translations(
         res = await process(
             tmp.name, params["model"], None, params["align"], params["diarize"],
             build_transcribe_kwargs(
-                params["batch_size"], params["beam_size"], params["best_of"],
-                params["patience"], params["length_penalty"],
+                params["batch_size"],
                 params["word_timestamps"], params["vad_filter"],
                 params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+            params["beam_size"], params["best_of"], params["patience"],
+            params["length_penalty"])
         return _fmt(res, params["response_format"])
