@@ -126,7 +126,16 @@ HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
+# Warmup flags
+WARMUP_MODEL = os.getenv("WARMUP_MODEL", "large-v3")
+WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
+WARMUP_DIARIZE = os.getenv("WARMUP_DIARIZE", "0") == "1"
+
 app = FastAPI(title="WhisperX Transcription API", version="1.8.5")
+
+@app.on_event("startup")
+async def on_startup():
+    warmup()
 
 # ───────── TTL caches ─────────
 class TTLCache(dict):
@@ -210,6 +219,20 @@ def load_diar():
     pip = _DP(use_auth_token=HF_TOKEN, device=DEVICE)
     D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
     return pip
+
+# ───────── Warmup ─────────
+def warmup():
+    """Pre-loads default models for faster first-request processing."""
+    logging.info("Warming up...")
+    if WARMUP_MODEL not in _MODELS:
+        logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
+        return
+    load_whisper(WARMUP_MODEL)
+    for lang in WARMUP_ALIGN_LANGS:
+        if lang: load_align(lang)
+    if WARMUP_DIARIZE:
+        load_diar()
+    logging.info("Warmup complete.")
 
 # ───────── /v1/models ─────────
 def is_cached(mid: str) -> bool:
