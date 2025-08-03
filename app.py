@@ -16,11 +16,12 @@ WhisperX Transcription API · v1.8.5
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Any
 
 import whisperx, srt, webvtt
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from huggingface_hub.errors import LocalEntryNotFoundError
 from urllib.parse import quote_plus
@@ -65,6 +66,33 @@ _MODELS = {
     "large-v3-turbo":   "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     "turbo":            "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
+
+class ModelId(str, Enum):
+    TINY_EN = "tiny.en"
+    TINY = "tiny"
+    BASE_EN = "base.en"
+    BASE = "base"
+    SMALL_EN = "small.en"
+    SMALL = "small"
+    MEDIUM_EN = "medium.en"
+    MEDIUM = "medium"
+    LARGE_V1 = "large-v1"
+    LARGE_V2 = "large-v2"
+    LARGE_V3 = "large-v3"
+    LARGE = "large"
+    DISTIL_LARGE_V2 = "distil-large-v2"
+    DISTIL_MEDIUM_EN = "distil-medium.en"
+    DISTIL_SMALL_EN = "distil-small.en"
+    DISTIL_LARGE_V3 = "distil-large-v3"
+    LARGE_V3_TURBO = "large-v3-turbo"
+    TURBO = "turbo"
+
+class ResponseFormat(str, Enum):
+    JSON = "json"
+    TEXT = "text"
+    SRT = "srt"
+    VTT = "vtt"
+    VERBOSE_JSON = "verbose_json"
 
 # ───────── Cache-scan helpers ─────────
 def _cache_roots() -> list[Path]:
@@ -243,37 +271,47 @@ threading.Thread(target=_sweep, daemon=True).start()
 # ───────── Pipeline ─────────
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     fname = Path(path).name
-    wav = whisperx.load_audio(path)
+    try:
+        wav = whisperx.load_audio(path)
+    except Exception as e:
+        logging.error("Error loading audio file %s: %s", fname, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
+
     audio_sec = len(wav) / 16000
     t0 = time.perf_counter()
 
-    # transcription
-    _log("transcribe_start", fname, "model=%s", model)
-    whisper, lock = load_whisper(model)
-    await run_sync(lock.acquire)
     try:
-        raw = await run_sync(whisper.transcribe, wav, **trans_kw)
-    finally:
-        lock.release()
-    res = standardize(raw)
-    _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
+        # transcription
+        _log("transcribe_start", fname, "model=%s", model)
+        whisper, lock = load_whisper(model)
+        await run_sync(lock.acquire)
+        try:
+            raw = await run_sync(whisper.transcribe, wav, **trans_kw)
+        finally:
+            lock.release()
+        res = standardize(raw)
+        _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-    # alignment
-    if do_align:
-        t = time.perf_counter(); lang_used = res.get("language") or lang
-        _log("align_start", fname, "lang=%s", lang_used)
-        model_a, meta = load_align(lang_used)
-        res = standardize(await run_sync(
-            whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
-        _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+        # alignment
+        if do_align:
+            t = time.perf_counter(); lang_used = res.get("language") or lang
+            _log("align_start", fname, "lang=%s", lang_used)
+            model_a, meta = load_align(lang_used)
+            res = standardize(await run_sync(
+                whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
+            _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-    # diarisation
-    if do_diar:
-        t = time.perf_counter(); _log("diarize_start", fname)
-        spk = await run_sync(load_diar(), wav, **diar_kw)
-        res = standardize(await run_sync(
-            whisperx.assign_word_speakers, spk, res), spk=True)
-        _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+        # diarisation
+        if do_diar:
+            t = time.perf_counter(); _log("diarize_start", fname)
+            spk = await run_sync(load_diar(), wav, **diar_kw)
+            res = standardize(await run_sync(
+                whisperx.assign_word_speakers, spk, res), spk=True)
+            _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+
+    except Exception as e:
+        logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error during processing: {e}")
 
     wall = time.perf_counter() - t0
     logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
@@ -309,66 +347,67 @@ def _fmt(res, fmt):
     if fmt == "verbose_json": return JSONResponse(res)
     return JSONResponse({"text": text})
 
+# ───────── Dependencies ─────────
+def common_form_params(
+    model: ModelId = Form("large-v3", description="Faster-Whisper model ID (see `/v1/models`)."),
+    align: bool = Form(False, description="Word-level alignment via Wav2Vec2."),
+    diarize: bool = Form(False, description="Speaker diarisation with `[SPK_n]` tags."),
+    response_format: ResponseFormat = Form("json", description="Response format (`json`, `text`, `srt`, `vtt`, `verbose_json`)."),
+    batch_size: int | None = Form(BATCH_SIZE, description="Whisper batch size."),
+    beam_size: int | None = Form(0, description="Beam width (0 → greedy)."),
+    best_of: int | None = Form(0, description="N-best for greedy."),
+    patience: float | None = Form(0.0, description="Beam search patience."),
+    length_penalty: float | None = Form(0.0, description="Beam length penalty."),
+    word_timestamps: bool = Form(False, description="Include word timestamps (needs new FW build)."),
+    vad_filter: bool = Form(False, description="Apply VAD before transcription."),
+    vad_threshold: float | None = Form(0.5, description="VAD probability threshold."),
+    min_speakers: int | None = Form(0, description="Lower bound for diarisation clustering."),
+    max_speakers: int | None = Form(0, description="Upper bound for diarisation clustering."),
+):
+    return dict(
+        model=model, align=align, diarize=diarize, response_format=response_format,
+        batch_size=batch_size, beam_size=beam_size, best_of=best_of, patience=patience,
+        length_penalty=length_penalty, word_timestamps=word_timestamps,
+        vad_filter=vad_filter, vad_threshold=vad_threshold,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+    )
+
 # ───────── Endpoints ─────────
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
-    file: UploadFile = File(...),
-    model: str = Form("large-v3"),
-    language: str | None = Form(None),
-    align: bool = Form(False),
-    diarize: bool = Form(False),
-    response_format: str = Form("json"),
-    batch_size: int | None = Form(BATCH_SIZE),
-    beam_size: int | None = Form(0),
-    best_of: int | None = Form(0),
-    patience: float | None = Form(0.0),
-    length_penalty: float | None = Form(0.0),
-    word_timestamps: bool = Form(False),
-    vad_filter: bool = Form(False),
-    vad_threshold: float | None = Form(0.5),
-    min_speakers: int | None = Form(0),
-    max_speakers: int | None = Form(0),
+    file: UploadFile = File(..., description="Binary audio (any FFmpeg-decodable format)."),
+    language: str | None = Form(None, description="Force language code; autodetect when omitted."),
+    params: dict = Depends(common_form_params),
 ):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".audio")
-    tmp.write(await file.read()); tmp.close()
-    try:
+    """Transcribes an audio file."""
+    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+        tmp.write(await file.read())
+        tmp.flush()
         res = await process(
-            tmp.name, model, language, align, diarize,
-            build_transcribe_kwargs(batch_size, beam_size, best_of, patience,
-                                    length_penalty, word_timestamps,
-                                    vad_filter, vad_threshold),
-            build_diar_kwargs(min_speakers, max_speakers))
-        return _fmt(res, response_format)
-    finally:
-        os.remove(tmp.name)
+            tmp.name, params["model"], language, params["align"], params["diarize"],
+            build_transcribe_kwargs(
+                params["batch_size"], params["beam_size"], params["best_of"],
+                params["patience"], params["length_penalty"],
+                params["word_timestamps"], params["vad_filter"],
+                params["vad_threshold"]),
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+        return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
 async def translations(
-    file: UploadFile = File(...),
-    model: str = Form("large-v3"),
-    align: bool = Form(False),
-    diarize: bool = Form(False),
-    response_format: str = Form("json"),
-    batch_size: int | None = Form(BATCH_SIZE),
-    beam_size: int | None = Form(0),
-    best_of: int | None = Form(0),
-    patience: float | None = Form(0.0),
-    length_penalty: float | None = Form(0.0),
-    word_timestamps: bool = Form(False),
-    vad_filter: bool = Form(False),
-    vad_threshold: float | None = Form(0.5),
-    min_speakers: int | None = Form(0),
-    max_speakers: int | None = Form(0),
+    file: UploadFile = File(..., description="Binary audio (any FFmpeg-decodable format)."),
+    params: dict = Depends(common_form_params),
 ):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".audio")
-    tmp.write(await file.read()); tmp.close()
-    try:
+    """Translates an audio file to English."""
+    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+        tmp.write(await file.read())
+        tmp.flush()
         res = await process(
-            tmp.name, model, None, align, diarize,
-            build_transcribe_kwargs(batch_size, beam_size, best_of, patience,
-                                    length_penalty, word_timestamps,
-                                    vad_filter, vad_threshold),
-            build_diar_kwargs(min_speakers, max_speakers))
-        return _fmt(res, response_format)
-    finally:
-        os.remove(tmp.name)
+            tmp.name, params["model"], None, params["align"], params["diarize"],
+            build_transcribe_kwargs(
+                params["batch_size"], params["beam_size"], params["best_of"],
+                params["patience"], params["length_penalty"],
+                params["word_timestamps"], params["vad_filter"],
+                params["vad_threshold"]),
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+        return _fmt(res, params["response_format"])
