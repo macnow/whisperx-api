@@ -13,6 +13,7 @@ WhisperX Transcription API · v1.8.5
 """
 
 # ───────── CUDA / TF32 OFF ─────────
+import json
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -138,6 +139,18 @@ if OFFLINE:
 WARMUP_MODEL = os.getenv("WARMUP_MODEL", "large-v3")
 WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
 WARMUP_DIARIZE = os.getenv("WARMUP_DIARIZE", "0") == "1"
+
+# ASR configuration
+DEFAULT_ASR_CONFIG = {
+    "large-v3": {
+        "beam_size": 5,
+        "patience": 1.0,
+        "length_penalty": 1.0,
+        "best_of": 5
+    }
+}
+ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
+ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
 app = FastAPI(title="WhisperX Transcription API", version="1.8.5")
 
@@ -314,9 +327,7 @@ def _sweep():
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
-async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw,
-                  beam_size: int | None, best_of: int | None,
-                  patience: float | None, length_penalty: float | None):
+async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     fname = Path(path).name
     try:
         wav = whisperx.load_audio(path)
@@ -330,8 +341,13 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw,
     try:
         # transcription
         _log("transcribe_start", fname, "model=%s", model)
-        asr_options = ASROptions(beam_size=beam_size, best_of=best_of,
-                                 patience=patience, length_penalty=length_penalty)
+        asr_config = ASR_CONFIG.get(model, {})
+        asr_options = ASROptions(
+            beam_size=asr_config.get("beam_size"),
+            patience=asr_config.get("patience"),
+            length_penalty=asr_config.get("length_penalty"),
+            best_of=asr_config.get("best_of"),
+        )
         whisper, lock = load_whisper(model, asr_options)
         await run_sync(lock.acquire)
         try:
@@ -398,10 +414,6 @@ def common_form_params(
     diarize: bool = Form(False, description="Speaker diarisation with `[SPK_n]` tags."),
     response_format: ResponseFormat = Form("json", description="Response format (`json`, `text`, `srt`, `vtt`, `verbose_json`)."),
     batch_size: int | None = Form(BATCH_SIZE, description="Whisper batch size."),
-    beam_size: int | None = Form(0, description="Beam width (0 → greedy)."),
-    best_of: int | None = Form(0, description="N-best for greedy."),
-    patience: float | None = Form(0.0, description="Beam search patience."),
-    length_penalty: float | None = Form(0.0, description="Beam length penalty."),
     word_timestamps: bool = Form(False, description="Include word timestamps (needs new FW build)."),
     vad_filter: bool = Form(False, description="Apply VAD before transcription."),
     vad_threshold: float | None = Form(0.5, description="VAD probability threshold."),
@@ -410,8 +422,7 @@ def common_form_params(
 ):
     return dict(
         model=model, align=align, diarize=diarize, response_format=response_format,
-        batch_size=batch_size, beam_size=beam_size, best_of=best_of, patience=patience,
-        length_penalty=length_penalty, word_timestamps=word_timestamps,
+        batch_size=batch_size, word_timestamps=word_timestamps,
         vad_filter=vad_filter, vad_threshold=vad_threshold,
         min_speakers=min_speakers, max_speakers=max_speakers,
     )
@@ -432,9 +443,7 @@ async def transcriptions(
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
-            params["beam_size"], params["best_of"], params["patience"],
-            params["length_penalty"])
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
         return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
@@ -451,7 +460,5 @@ async def translations(
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
-            params["beam_size"], params["best_of"], params["patience"],
-            params["length_penalty"])
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
         return _fmt(res, params["response_format"])
