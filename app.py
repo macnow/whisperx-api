@@ -262,7 +262,16 @@ def warmup():
     if WARMUP_MODEL not in _MODELS:
         logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
         return
-    load_whisper(WARMUP_MODEL, ASROptions(beam_size=0, best_of=0, patience=0.0, length_penalty=0.0))
+
+    asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
+    asr_options = ASROptions(
+        beam_size=asr_config.get("beam_size"),
+        patience=asr_config.get("patience"),
+        length_penalty=asr_config.get("length_penalty"),
+        best_of=asr_config.get("best_of"),
+    )
+    load_whisper(WARMUP_MODEL, asr_options)
+
     for lang in WARMUP_ALIGN_LANGS:
         if lang: load_align(lang)
     if WARMUP_DIARIZE:
