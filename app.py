@@ -293,7 +293,7 @@ def models():
 
 # ───────── Text helpers ─────────
 def split_segments_by_speaker(segments: list[dict]) -> list[dict]:
-    """Splits segments into smaller segments whenever the speaker changes."""
+    """Splits segments into smaller segments whenever the speaker changes at a sentence boundary."""
     if not segments or "words" not in segments[0] or not segments[0]["words"]:
         return segments
 
@@ -305,9 +305,18 @@ def split_segments_by_speaker(segments: list[dict]) -> list[dict]:
 
         current_speaker = segment["words"][0].get("speaker")
         current_words = []
-        for word in segment["words"]:
+        for i, word in enumerate(segment["words"]):
             speaker = word.get("speaker")
-            if speaker != current_speaker and current_words:
+
+            is_new_sentence = False
+            if i > 0:
+                prev_word = segment["words"][i-1]["word"]
+                if prev_word.endswith(('.', '?', '!')):
+                    is_new_sentence = True
+            else:
+                is_new_sentence = True
+
+            if speaker != current_speaker and is_new_sentence and current_words:
                 new_segments.append({
                     "start": current_words[0]["start"],
                     "end": current_words[-1]["end"],
