@@ -292,6 +292,45 @@ def models():
     ]}
 
 # ───────── Text helpers ─────────
+def split_segments_by_speaker(segments: list[dict]) -> list[dict]:
+    """Splits segments into smaller segments whenever the speaker changes."""
+    if not segments or "words" not in segments[0] or not segments[0]["words"]:
+        return segments
+
+    new_segments = []
+    for segment in segments:
+        if "words" not in segment or not segment["words"]:
+            new_segments.append(segment)
+            continue
+
+        current_speaker = segment["words"][0].get("speaker")
+        current_words = []
+        for word in segment["words"]:
+            speaker = word.get("speaker")
+            if speaker != current_speaker and current_words:
+                new_segments.append({
+                    "start": current_words[0]["start"],
+                    "end": current_words[-1]["end"],
+                    "text": " ".join(w["word"] for w in current_words),
+                    "speaker": current_speaker,
+                    "words": current_words,
+                })
+                current_words = []
+
+            current_speaker = speaker
+            current_words.append(word)
+
+        if current_words:
+            new_segments.append({
+                "start": current_words[0]["start"],
+                "end": current_words[-1]["end"],
+                "text": " ".join(w["word"] for w in current_words),
+                "speaker": current_speaker,
+                "words": current_words,
+            })
+
+    return new_segments
+
 def _tagged(seg):
     out, cur = [], None
     for s in seg:
@@ -304,9 +343,13 @@ def _tagged(seg):
 def standardize(raw, spk=False):
     if isinstance(raw, dict) and "segments" in raw:
         seg = raw["segments"]
+        if spk:
+            seg = split_segments_by_speaker(seg)
         txt = _tagged(seg) if spk else raw.get("text") or " ".join(s["text"].strip() for s in seg)
         return {"text": txt, "segments": seg, "language": raw.get("language")}
     if isinstance(raw, list):
+        if spk:
+            raw = split_segments_by_speaker(raw)
         txt = _tagged(raw) if spk else " ".join(s["text"].strip() for s in raw)
         return {"text": txt, "segments": raw, "language": None}
     return {"text": "", "segments": [], "language": None}
