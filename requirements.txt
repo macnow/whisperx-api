@@ -1,0 +1,15 @@
+# Base dependencies (likely included in the Docker base image)
+torch
+whisperx
+
+# API and web server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Subtitle format handling
+srt
+webvtt-py
+
+# Hugging Face Hub for model management
+huggingface-hub

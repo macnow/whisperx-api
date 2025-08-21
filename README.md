@@ -62,6 +62,10 @@ volumes:
 | `FASTER_WHISPER_THREADS` | `0` | Value forwarded to Faster‑Whisper `threads` (0 = not passed). |
 | `HF_TOKEN` | — | HF access token for private diarisation models. |
 | `LOCAL_ONLY_MODELS` | `0` | `1` → forbid downloads, fail if model not cached. |
+| `WARMUP_MODEL` | `large-v3` | Whisper model ID to preload on startup. |
+| `WARMUP_ALIGN_LANGS` | `en` | Comma-separated list of language codes to preload alignment models for. |
+| `WARMUP_DIARIZE` | `0` | `1` → preload the diarization model. |
+| `ASR_CONFIG_JSON` | — | JSON string to configure ASR options per model. See code for default. |
 | `HF_HOME`, `XDG_CACHE_HOME` | — | Override HuggingFace cache location. |
 
 ⚠️ **TF32 is disabled globally** for reproducibility.
@@ -83,10 +87,6 @@ Upload audio, receive transcription (optionally aligned & diarised).
 | `diarize` | `false` | Speaker diarisation with `[SPK_n]` tags. |
 | `response_format` | `json` | `json`, `text`, `srt`, `vtt`, `verbose_json`. |
 | `batch_size` | `16` | Whisper batch size. |
-| `beam_size` | `0` | Beam width (`0` → greedy). |
-| `best_of` | `0` | n‑best for greedy. |
-| `patience` | `0.0` | Beam search patience. |
-| `length_penalty` | `0.0` | Beam length penalty. |
 | `word_timestamps` | `false` | Include word timestamps (needs new FW build). |
 | `vad_filter` | `false` | Apply VAD before transcription. |
 | `vad_threshold` | `0.5` | VAD probability threshold. |
