@@ -13,14 +13,17 @@ WhisperX Transcription API · v1.8.5
 """
 
 # ───────── CUDA / TF32 OFF ─────────
+import json
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Any
 
 import whisperx, srt, webvtt
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from huggingface_hub.errors import LocalEntryNotFoundError
 from urllib.parse import quote_plus
@@ -66,6 +69,40 @@ _MODELS = {
     "turbo":            "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
 
+class ModelId(str, Enum):
+    TINY_EN = "tiny.en"
+    TINY = "tiny"
+    BASE_EN = "base.en"
+    BASE = "base"
+    SMALL_EN = "small.en"
+    SMALL = "small"
+    MEDIUM_EN = "medium.en"
+    MEDIUM = "medium"
+    LARGE_V1 = "large-v1"
+    LARGE_V2 = "large-v2"
+    LARGE_V3 = "large-v3"
+    LARGE = "large"
+    DISTIL_LARGE_V2 = "distil-large-v2"
+    DISTIL_MEDIUM_EN = "distil-medium.en"
+    DISTIL_SMALL_EN = "distil-small.en"
+    DISTIL_LARGE_V3 = "distil-large-v3"
+    LARGE_V3_TURBO = "large-v3-turbo"
+    TURBO = "turbo"
+
+class ResponseFormat(str, Enum):
+    JSON = "json"
+    TEXT = "text"
+    SRT = "srt"
+    VTT = "vtt"
+    VERBOSE_JSON = "verbose_json"
+
+@dataclass(frozen=True)
+class ASROptions:
+    beam_size: int | None
+    patience: float | None
+    length_penalty: float | None
+    best_of: int | None
+
 # ───────── Cache-scan helpers ─────────
 def _cache_roots() -> list[Path]:
     """Return every plausible HF cache directory that exists."""
@@ -98,7 +135,28 @@ HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
+# Warmup flags
+WARMUP_MODEL = os.getenv("WARMUP_MODEL", "large-v3")
+WARMUP_ALIGN_LANGS = [lang.strip() for lang in os.getenv("WARMUP_ALIGN_LANGS", "en").split(",")]
+WARMUP_DIARIZE = os.getenv("WARMUP_DIARIZE", "0") == "1"
+
+# ASR configuration
+DEFAULT_ASR_CONFIG = {
+    "large-v3": {
+        "beam_size": 5,
+        "patience": 1.0,
+        "length_penalty": 1.0,
+        "best_of": 5
+    }
+}
+ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
+ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
+
 app = FastAPI(title="WhisperX Transcription API", version="1.8.5")
+
+@app.on_event("startup")
+async def on_startup():
+    warmup()
 
 # ───────── TTL caches ─────────
 class TTLCache(dict):
@@ -137,22 +195,36 @@ def _load_end(lbl: str, key: str, before: int):
                  key, delta, free_mb())
 
 # ───────── Loaders ─────────
-def load_whisper(model_id: str):
+def load_whisper(model_id: str, asr_options: ASROptions):
     """Return (pipeline, lock); raise 400 offline if model isn’t cached."""
-    existing = W_CACHE.get(model_id)
+    cache_key = (model_id, asr_options)
+    lock_key = str(cache_key)
+    existing = W_CACHE.get(cache_key)
     if existing:
-        if model_id not in LOCKS:
-            LOCKS[model_id] = threading.Lock()
-        return existing, LOCKS[model_id]
+        if lock_key not in LOCKS:
+            LOCKS[lock_key] = threading.Lock()
+        return existing, LOCKS[lock_key]
 
-    before = free_mb(); _load_start("whisper", model_id)
-    kw = dict(compute_type=COMPUTE_TYPE,
-              local_files_only=OFFLINE,
-              device=DEVICE)
+    log_key = f"{model_id} asr_opts={asr_options}"
+    before = free_mb(); _load_start("whisper", log_key)
+
+    options_dict = {
+        k: v for k, v in asr_options.__dict__.items()
+        if v is not None and v != 0 and v != 0.0
+    }
+
+    load_kw = dict(
+        compute_type=COMPUTE_TYPE,
+        local_files_only=OFFLINE,
+        device=DEVICE,
+        asr_options=options_dict,
+    )
+
     if FW_THREADS:
-        kw["threads"] = FW_THREADS
+        load_kw["threads"] = FW_THREADS
+
     try:
-        model = whisperx.load_model(model_id, **kw)
+        model = whisperx.load_model(model_id, **load_kw)
     except LocalEntryNotFoundError:
         raise HTTPException(
             status_code=400,
@@ -160,9 +232,9 @@ def load_whisper(model_id: str):
                     "LOCAL_ONLY_MODELS=1 prevents downloading.")
         ) from None
 
-    W_CACHE.put(model_id, model); _load_end("whisper", model_id, before)
-    LOCKS[model_id] = threading.Lock()
-    return model, LOCKS[model_id]
+    W_CACHE.put(cache_key, model); _load_end("whisper", log_key, before)
+    LOCKS[lock_key] = threading.Lock()
+    return model, LOCKS[lock_key]
 
 def load_align(lang: str):
     key = lang or "default"
@@ -183,6 +255,29 @@ def load_diar():
     D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
     return pip
 
+# ───────── Warmup ─────────
+def warmup():
+    """Pre-loads default models for faster first-request processing."""
+    logging.info("Warming up...")
+    if WARMUP_MODEL not in _MODELS:
+        logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
+        return
+
+    asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
+    asr_options = ASROptions(
+        beam_size=asr_config.get("beam_size"),
+        patience=asr_config.get("patience"),
+        length_penalty=asr_config.get("length_penalty"),
+        best_of=asr_config.get("best_of"),
+    )
+    load_whisper(WARMUP_MODEL, asr_options)
+
+    for lang in WARMUP_ALIGN_LANGS:
+        if lang: load_align(lang)
+    if WARMUP_DIARIZE:
+        load_diar()
+    logging.info("Warmup complete.")
+
 # ───────── /v1/models ─────────
 def is_cached(mid: str) -> bool:
     return mid in local_sizes() or mid in W_CACHE
@@ -197,6 +292,54 @@ def models():
     ]}
 
 # ───────── Text helpers ─────────
+def split_segments_by_speaker(segments: list[dict]) -> list[dict]:
+    """Splits segments into smaller segments whenever the speaker changes at a sentence boundary."""
+    if not segments or "words" not in segments[0] or not segments[0]["words"]:
+        return segments
+
+    new_segments = []
+    for segment in segments:
+        if "words" not in segment or not segment["words"]:
+            new_segments.append(segment)
+            continue
+
+        current_speaker = segment["words"][0].get("speaker")
+        current_words = []
+        for i, word in enumerate(segment["words"]):
+            speaker = word.get("speaker")
+
+            is_new_sentence = False
+            if i > 0:
+                prev_word = segment["words"][i-1]["word"]
+                if prev_word.endswith(('.', '?', '!')):
+                    is_new_sentence = True
+            else:
+                is_new_sentence = True
+
+            if speaker != current_speaker and is_new_sentence and current_words:
+                new_segments.append({
+                    "start": current_words[0]["start"],
+                    "end": current_words[-1]["end"],
+                    "text": " ".join(w["word"] for w in current_words),
+                    "speaker": current_speaker,
+                    "words": current_words,
+                })
+                current_words = []
+
+            current_speaker = speaker
+            current_words.append(word)
+
+        if current_words:
+            new_segments.append({
+                "start": current_words[0]["start"],
+                "end": current_words[-1]["end"],
+                "text": " ".join(w["word"] for w in current_words),
+                "speaker": current_speaker,
+                "words": current_words,
+            })
+
+    return new_segments
+
 def _tagged(seg):
     out, cur = [], None
     for s in seg:
@@ -209,9 +352,13 @@ def _tagged(seg):
 def standardize(raw, spk=False):
     if isinstance(raw, dict) and "segments" in raw:
         seg = raw["segments"]
+        if spk:
+            seg = split_segments_by_speaker(seg)
         txt = _tagged(seg) if spk else raw.get("text") or " ".join(s["text"].strip() for s in seg)
         return {"text": txt, "segments": seg, "language": raw.get("language")}
     if isinstance(raw, list):
+        if spk:
+            raw = split_segments_by_speaker(raw)
         txt = _tagged(raw) if spk else " ".join(s["text"].strip() for s in raw)
         return {"text": txt, "segments": raw, "language": None}
     return {"text": "", "segments": [], "language": None}
@@ -243,37 +390,54 @@ threading.Thread(target=_sweep, daemon=True).start()
 # ───────── Pipeline ─────────
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     fname = Path(path).name
-    wav = whisperx.load_audio(path)
+    try:
+        wav = whisperx.load_audio(path)
+    except Exception as e:
+        logging.error("Error loading audio file %s: %s", fname, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
+
     audio_sec = len(wav) / 16000
     t0 = time.perf_counter()
 
-    # transcription
-    _log("transcribe_start", fname, "model=%s", model)
-    whisper, lock = load_whisper(model)
-    await run_sync(lock.acquire)
     try:
-        raw = await run_sync(whisper.transcribe, wav, **trans_kw)
-    finally:
-        lock.release()
-    res = standardize(raw)
-    _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
+        # transcription
+        _log("transcribe_start", fname, "model=%s", model)
+        asr_config = ASR_CONFIG.get(model, {})
+        asr_options = ASROptions(
+            beam_size=asr_config.get("beam_size"),
+            patience=asr_config.get("patience"),
+            length_penalty=asr_config.get("length_penalty"),
+            best_of=asr_config.get("best_of"),
+        )
+        whisper, lock = load_whisper(model, asr_options)
+        await run_sync(lock.acquire)
+        try:
+            raw = await run_sync(whisper.transcribe, wav, **trans_kw)
+        finally:
+            lock.release()
+        res = standardize(raw)
+        _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-    # alignment
-    if do_align:
-        t = time.perf_counter(); lang_used = res.get("language") or lang
-        _log("align_start", fname, "lang=%s", lang_used)
-        model_a, meta = load_align(lang_used)
-        res = standardize(await run_sync(
-            whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
-        _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+        # alignment
+        if do_align:
+            t = time.perf_counter(); lang_used = res.get("language") or lang
+            _log("align_start", fname, "lang=%s", lang_used)
+            model_a, meta = load_align(lang_used)
+            res = standardize(await run_sync(
+                whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
+            _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-    # diarisation
-    if do_diar:
-        t = time.perf_counter(); _log("diarize_start", fname)
-        spk = await run_sync(load_diar(), wav, **diar_kw)
-        res = standardize(await run_sync(
-            whisperx.assign_word_speakers, spk, res), spk=True)
-        _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+        # diarisation
+        if do_diar:
+            t = time.perf_counter(); _log("diarize_start", fname)
+            spk = await run_sync(load_diar(), wav, **diar_kw)
+            res = standardize(await run_sync(
+                whisperx.assign_word_speakers, spk, res), spk=True)
+            _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+
+    except Exception as e:
+        logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error during processing: {e}")
 
     wall = time.perf_counter() - t0
     logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
@@ -281,13 +445,8 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
     return res
 
 # ───────── KW builders ─────────
-def build_transcribe_kwargs(batch, beam, best, patience, length_penalty,
-                            word_ts, vad, vad_thr):
+def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
     kw = {"batch_size": batch or BATCH_SIZE}
-    if beam: kw["beam_size"] = beam
-    if best: kw["best_of"] = best
-    if patience: kw["patience"] = patience
-    if length_penalty: kw["length_penalty"] = length_penalty
     if vad:
         kw["vad_filter"] = True
         if vad_thr:
@@ -309,66 +468,58 @@ def _fmt(res, fmt):
     if fmt == "verbose_json": return JSONResponse(res)
     return JSONResponse({"text": text})
 
+# ───────── Dependencies ─────────
+def common_form_params(
+    model: ModelId = Form("large-v3", description="Faster-Whisper model ID (see `/v1/models`)."),
+    align: bool = Form(False, description="Word-level alignment via Wav2Vec2."),
+    diarize: bool = Form(False, description="Speaker diarisation with `[SPK_n]` tags."),
+    response_format: ResponseFormat = Form("json", description="Response format (`json`, `text`, `srt`, `vtt`, `verbose_json`)."),
+    batch_size: int | None = Form(BATCH_SIZE, description="Whisper batch size."),
+    word_timestamps: bool = Form(False, description="Include word timestamps (needs new FW build)."),
+    vad_filter: bool = Form(False, description="Apply VAD before transcription."),
+    vad_threshold: float | None = Form(0.5, description="VAD probability threshold."),
+    min_speakers: int | None = Form(0, description="Lower bound for diarisation clustering."),
+    max_speakers: int | None = Form(0, description="Upper bound for diarisation clustering."),
+):
+    return dict(
+        model=model, align=align, diarize=diarize, response_format=response_format,
+        batch_size=batch_size, word_timestamps=word_timestamps,
+        vad_filter=vad_filter, vad_threshold=vad_threshold,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+    )
+
 # ───────── Endpoints ─────────
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
-    file: UploadFile = File(...),
-    model: str = Form("large-v3"),
-    language: str | None = Form(None),
-    align: bool = Form(False),
-    diarize: bool = Form(False),
-    response_format: str = Form("json"),
-    batch_size: int | None = Form(BATCH_SIZE),
-    beam_size: int | None = Form(0),
-    best_of: int | None = Form(0),
-    patience: float | None = Form(0.0),
-    length_penalty: float | None = Form(0.0),
-    word_timestamps: bool = Form(False),
-    vad_filter: bool = Form(False),
-    vad_threshold: float | None = Form(0.5),
-    min_speakers: int | None = Form(0),
-    max_speakers: int | None = Form(0),
+    file: UploadFile = File(..., description="Binary audio (any FFmpeg-decodable format)."),
+    language: str | None = Form(None, description="Force language code; autodetect when omitted."),
+    params: dict = Depends(common_form_params),
 ):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".audio")
-    tmp.write(await file.read()); tmp.close()
-    try:
+    """Transcribes an audio file."""
+    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+        tmp.write(await file.read())
+        tmp.flush()
         res = await process(
-            tmp.name, model, language, align, diarize,
-            build_transcribe_kwargs(batch_size, beam_size, best_of, patience,
-                                    length_penalty, word_timestamps,
-                                    vad_filter, vad_threshold),
-            build_diar_kwargs(min_speakers, max_speakers))
-        return _fmt(res, response_format)
-    finally:
-        os.remove(tmp.name)
+            tmp.name, params["model"], language, params["align"], params["diarize"],
+            build_transcribe_kwargs(
+                params["batch_size"], params["word_timestamps"],
+                params["vad_filter"], params["vad_threshold"]),
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+        return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
 async def translations(
-    file: UploadFile = File(...),
-    model: str = Form("large-v3"),
-    align: bool = Form(False),
-    diarize: bool = Form(False),
-    response_format: str = Form("json"),
-    batch_size: int | None = Form(BATCH_SIZE),
-    beam_size: int | None = Form(0),
-    best_of: int | None = Form(0),
-    patience: float | None = Form(0.0),
-    length_penalty: float | None = Form(0.0),
-    word_timestamps: bool = Form(False),
-    vad_filter: bool = Form(False),
-    vad_threshold: float | None = Form(0.5),
-    min_speakers: int | None = Form(0),
-    max_speakers: int | None = Form(0),
+    file: UploadFile = File(..., description="Binary audio (any FFmpeg-decodable format)."),
+    params: dict = Depends(common_form_params),
 ):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".audio")
-    tmp.write(await file.read()); tmp.close()
-    try:
+    """Translates an audio file to English."""
+    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+        tmp.write(await file.read())
+        tmp.flush()
         res = await process(
-            tmp.name, model, None, align, diarize,
-            build_transcribe_kwargs(batch_size, beam_size, best_of, patience,
-                                    length_penalty, word_timestamps,
-                                    vad_filter, vad_threshold),
-            build_diar_kwargs(min_speakers, max_speakers))
-        return _fmt(res, response_format)
-    finally:
-        os.remove(tmp.name)
+            tmp.name, params["model"], None, params["align"], params["diarize"],
+            build_transcribe_kwargs(
+                params["batch_size"], params["word_timestamps"],
+                params["vad_filter"], params["vad_threshold"]),
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+        return _fmt(res, params["response_format"])
