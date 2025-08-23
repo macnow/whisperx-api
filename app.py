@@ -154,7 +154,7 @@ DEFAULT_ASR_CONFIG = {
 ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
 ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
-app = FastAPI(title="WhisperX Transcription API", version="1.8.5")
+app = FastAPI(title="WhisperX Transcription API", version="1.8.8")
 
 @app.on_event("startup")
 async def on_startup():
@@ -173,7 +173,7 @@ class TTLCache(dict):
         for k, (_, ts) in list(self.items()):
             if now - ts > ttl:
                 del self[k]; torch.cuda.empty_cache()
-                key = {"whisper": "model", "align": "lang", "diarize": "pipeline"}[self.label]
+                key = {"whisper": "model", "align": "lang", "diarize": "model"}[self.label]
                 logging.info("[%s_model_unload]  %s=%s  freeVRAM=%d MB",
                              self.label, key, k, free_mb())
 
@@ -181,19 +181,18 @@ W_CACHE, A_CACHE, D_CACHE = TTLCache("whisper"), TTLCache("align"), TTLCache("di
 LOCKS: Dict[str, threading.Lock] = {}
 
 # ───────── Logging helpers ─────────
-from pathlib import Path
 def _log(tag: str, fname: str, msg: str = "", *a):
     logging.info("[%s] %s  freeVRAM=%d MB " + msg,
                  tag, Path(fname).name, free_mb(), *a)
 
 def _load_start(lbl: str, key: str):
     logging.info("[%s_model_load_start]  %s=%s  freeVRAM=%d MB",
-                 lbl, "model" if lbl == "whisper" or lbl == "diarize" else "lang", key, free_mb())
+                 lbl, "model" if lbl in ("whisper", "diarize") else "lang", key, free_mb())
 
 def _load_end(lbl: str, key: str, before: int):
     delta = before - free_mb()
     logging.info("[%s_model_load_end]    %s=%s  used=%+d MB  freeVRAM=%d MB",
-                 lbl, "model" if lbl == "whisper" or lbl == "diarize" else "lang",
+                 lbl, "model" if lbl in ("whisper", "diarize") else "lang",
                  key, delta, free_mb())
 
 # ───────── Loaders ─────────
@@ -247,15 +246,18 @@ def load_align(lang: str):
     A_CACHE.put(key, (model, meta)); _load_end("align", key, before)
     return model, meta
 
-def load_diar():
-    diar_model_name = DIARIZATION_MODEL or "pyannote/speaker-diarization-3.1"
-    pip = D_CACHE.get("pipeline")
+def load_diar(model_name: str | None = None):
+    """Load diarization pipeline; cache per model name."""
+    diar_model_name = model_name or DIARIZATION_MODEL or "pyannote/speaker-diarization-3.1"
+    pip = D_CACHE.get(diar_model_name)
     if pip: return pip
     before = free_mb(); _load_start("diarize", diar_model_name)
-    try: from whisperx.diarize import DiarizationPipeline as _DP
-    except ImportError: from whisperx.diarization import DiarizationPipeline as _DP
-    pip = _DP(model_name=DIARIZATION_MODEL, use_auth_token=HF_TOKEN, device=DEVICE)
-    D_CACHE.put("pipeline", pip); _load_end("diarize", diar_model_name, before)
+    try:
+        from whisperx.diarize import DiarizationPipeline as _DP
+    except ImportError:
+        from whisperx.diarization import DiarizationPipeline as _DP
+    pip = _DP(model_name=diar_model_name, use_auth_token=HF_TOKEN, device=DEVICE)
+    D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
     return pip
 
 # ───────── Warmup ─────────
@@ -283,7 +285,8 @@ def warmup():
 
 # ───────── /v1/models ─────────
 def is_cached(mid: str) -> bool:
-    return mid in local_sizes() or mid in W_CACHE
+    # Note: quick heuristic; W_CACHE keys include ASR options so this isn't exhaustive.
+    return mid in local_sizes() or any(isinstance(k, tuple) and k[0] == mid for k in W_CACHE.keys())
 
 @app.get("/v1/models")
 def models():
@@ -379,7 +382,7 @@ def vtt_from(seg):
     for s in seg:
         v.captions.append(webvtt.Caption(
             start=webvtt.Caption.time_to_webvtt(s["start"]),
-            end  =webvtt.Caption.time_to_webvtt(s["end"]),
+            end  = webvtt.Caption.time_to_webvtt(s["end"]),
             text=(f"[{s['speaker']}] " if s.get("speaker") else "") + s["text"].strip()))
     return v.content
 
@@ -391,7 +394,7 @@ def _sweep():
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
-async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
+async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_model_name: str | None):
     fname = Path(path).name
     try:
         wav = whisperx.load_audio(path)
@@ -433,7 +436,8 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw):
         # diarisation
         if do_diar:
             t = time.perf_counter(); _log("diarize_start", fname)
-            spk = await run_sync(load_diar(), wav, **diar_kw)
+            diar_pipe = load_diar(diar_model_name)
+            spk = await run_sync(diar_pipe, wav, **diar_kw)
             res = standardize(await run_sync(
                 whisperx.assign_word_speakers, spk, res), spk=True)
             _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
@@ -483,12 +487,18 @@ def common_form_params(
     vad_threshold: float | None = Form(0.5, description="VAD probability threshold."),
     min_speakers: int | None = Form(0, description="Lower bound for diarisation clustering."),
     max_speakers: int | None = Form(0, description="Upper bound for diarisation clustering."),
+    diarization_model: str | None = Form(
+        None,
+        description="Override diarization model (e.g. 'pyannote/speaker-diarization-3.1'). "
+                    "Defaults to env DIARIZATION_MODEL or pyannote/3.1"
+    ),
 ):
     return dict(
         model=model, align=align, diarize=diarize, response_format=response_format,
         batch_size=batch_size, word_timestamps=word_timestamps,
         vad_filter=vad_filter, vad_threshold=vad_threshold,
         min_speakers=min_speakers, max_speakers=max_speakers,
+        diarization_model=diarization_model,
     )
 
 # ───────── Endpoints ─────────
@@ -507,7 +517,9 @@ async def transcriptions(
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+            params["diarization_model"],
+        )
         return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
@@ -524,5 +536,7 @@ async def translations(
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]))
+            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+            params["diarization_model"],
+        )
         return _fmt(res, params["response_format"])
