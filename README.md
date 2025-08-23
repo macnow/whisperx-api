@@ -1,11 +1,15 @@
-# WhisperX Transcription API · v1.8.5
+# WhisperX Transcription API · v1.8.6
 
 Open‑source, **OpenAI‑compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.  
 Runs GPU‑only, supports every Faster‑Whisper variant, and can operate fully offline.
 
 ---
 
-## What’s new in 1.8.5  (2025‑08‑04)
+## What’s new in 1.8.6  (2025‑08‑23)
+
+* Added `DIARIZE_MODEL` environment to overwrite default model for diarization (pyannote/speaker-diarization-3.1)
+
+## What’s new in 1.8.5 (2025‑08‑04)
 
 * `/v1/models` (offline mode) now scans **all** HF cache roots
   (`HF_HOME`, `XDG_CACHE_HOME`, `~/.cache`, `/root/.cache`, `/.cache`), so
