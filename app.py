@@ -248,13 +248,14 @@ def load_align(lang: str):
     return model, meta
 
 def load_diar():
+    diar_model_name = DIARIZATION_MODEL or "pyannote/speaker-diarization-3.1"
     pip = D_CACHE.get("pipeline")
     if pip: return pip
-    before = free_mb(); _load_start("diarize", "pipeline")
+    before = free_mb(); _load_start("diarize", diar_model_name)
     try: from whisperx.diarize import DiarizationPipeline as _DP
     except ImportError: from whisperx.diarization import DiarizationPipeline as _DP
     pip = _DP(model_name=DIARIZATION_MODEL, use_auth_token=HF_TOKEN, device=DEVICE)
-    D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
+    D_CACHE.put("pipeline", pip); _load_end("diarize", diar_model_name, before)
     return pip
 
 # ───────── Warmup ─────────
