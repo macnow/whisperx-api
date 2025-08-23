@@ -1,13 +1,13 @@
-# WhisperX Transcription API · v1.8.6
+# WhisperX Transcription API · v1.8.7
 
 Open‑source, **OpenAI‑compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.  
 Runs GPU‑only, supports every Faster‑Whisper variant, and can operate fully offline.
 
 ---
 
-## What’s new in 1.8.6  (2025‑08‑23)
+## What’s new in 1.8.7  (2025‑08‑23)
 
-* Added `DIARIZE_MODEL` environment to overwrite default model for diarization (pyannote/speaker-diarization-3.1)
+* Added `DIARIZATION_MODEL` environment variable to overwrite default model for diarization (pyannote/speaker-diarization-3.1)
 
 ## What’s new in 1.8.5 (2025‑08‑04)
 
@@ -70,6 +70,7 @@ volumes:
 | `WARMUP_ALIGN_LANGS` | `en` | Comma-separated list of language codes to preload alignment models for. |
 | `WARMUP_DIARIZE` | `0` | `1` → preload the diarization model. |
 | `ASR_CONFIG_JSON` | — | JSON string to configure ASR options per model. See code for default. |
+| `DIARIZATION_MODEL` | - | Override default diarization model. |
 | `HF_HOME`, `XDG_CACHE_HOME` | — | Override HuggingFace cache location. |
 
 ⚠️ **TF32 is disabled globally** for reproducibility.
