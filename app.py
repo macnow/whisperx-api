@@ -132,7 +132,7 @@ def local_sizes() -> list[str]:
 OFFLINE  = os.getenv("LOCAL_ONLY_MODELS", "0") == "1"
 TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
-DIARIZE_MODEL = os.getenv("DIARIZE_MODEL", "").strip() or None
+DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "").strip() or None
 
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
