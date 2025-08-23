@@ -132,6 +132,8 @@ def local_sizes() -> list[str]:
 OFFLINE  = os.getenv("LOCAL_ONLY_MODELS", "0") == "1"
 TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
+DIARIZE_MODEL = os.getenv("DIARIZE_MODEL", "").strip() or None
+
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
@@ -251,7 +253,7 @@ def load_diar():
     before = free_mb(); _load_start("diarize", "pipeline")
     try: from whisperx.diarize import DiarizationPipeline as _DP
     except ImportError: from whisperx.diarization import DiarizationPipeline as _DP
-    pip = _DP(use_auth_token=HF_TOKEN, device=DEVICE)
+    pip = _DP(model_name=DIARIZATION_MODEL, use_auth_token=HF_TOKEN, device=DEVICE)
     D_CACHE.put("pipeline", pip); _load_end("diarize", "pipeline", before)
     return pip
 
