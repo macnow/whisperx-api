@@ -4,6 +4,23 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.8.8] - 2025-08-24
+### Added
+- **Per-request diarisation model selection** – new form field  
+  `diarization_model` allows clients to override the diarisation backend
+  (e.g. `pyannote/speaker-diarization-3.1`) on each request.  
+  Falls back to `$DIARIZATION_MODEL` or the default *pyannote/3.1* when omitted.
+- **Cache-per-model diarisation** – diarisation pipelines are now cached
+  separately per model name with TTL-based eviction.
+
+### Changed
+- Diarisation cache & unload logging now use `model=<name>` instead of the
+  generic `pipeline` label, improving clarity in logs.
+- `/v1/audio/transcriptions` and `/v1/audio/translations` endpoints updated to
+  forward the requested diarisation model through the processing pipeline.
+
+---
+
 ## [1.8.5] – 2025-08-04
 ### Fixed
 - **Offline catalogue** – `/v1/models` now scans *all* plausible HuggingFace
