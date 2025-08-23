@@ -1,5 +1,5 @@
 """
-WhisperX Transcription API · v1.8.5
+WhisperX Transcription API · v1.8.8
 (OpenAI-compatible)
 
 •  GPU-only WhisperX wrapper with optional alignment & diarisation
@@ -188,12 +188,12 @@ def _log(tag: str, fname: str, msg: str = "", *a):
 
 def _load_start(lbl: str, key: str):
     logging.info("[%s_model_load_start]  %s=%s  freeVRAM=%d MB",
-                 lbl, "model" if lbl == "whisper" else "lang", key, free_mb())
+                 lbl, "model" if lbl == "whisper" or lbl == "diarize" else "lang", key, free_mb())
 
 def _load_end(lbl: str, key: str, before: int):
     delta = before - free_mb()
     logging.info("[%s_model_load_end]    %s=%s  used=%+d MB  freeVRAM=%d MB",
-                 lbl, "model" if lbl == "whisper" else "lang",
+                 lbl, "model" if lbl == "whisper" or lbl == "diarize" else "lang",
                  key, delta, free_mb())
 
 # ───────── Loaders ─────────
