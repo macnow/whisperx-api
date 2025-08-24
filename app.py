@@ -490,7 +490,7 @@ def common_form_params(
     diarization_model: str | None = Form(
         None,
         description="Override diarization model (e.g. 'pyannote/speaker-diarization-3.1'). "
-                    "Defaults to env DIARIZATION_MODEL or pyannote/3.1"
+                    "Defaults to env DIARIZATION_MODEL or 'pyannote/speaker-diarization-3.1'"
     ),
 ):
     return dict(
