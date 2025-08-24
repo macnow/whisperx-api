@@ -166,7 +166,10 @@ class TTLCache(dict):
     def __init__(self, label: str): super().__init__(); self.label = label
     def get(self, k):
         v = super().get(k)
-        if v: super().__setitem__(k, (v[0], time.time())); return v[0]
+        if v is None:
+            return None
+        super().__setitem__(k, (v[0], time.time()))
+        return v[0]
     def put(self, k, obj): super().__setitem__(k, (obj, time.time()))
     def sweep(self, ttl: int):
         now = time.time()
