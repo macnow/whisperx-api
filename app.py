@@ -456,7 +456,11 @@ def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
     kw = {"batch_size": batch or BATCH_SIZE}
     if vad:
         kw["vad_filter"] = True
-        if vad_thr:
+        # `vad_threshold` may legitimately be ``0``.  The previous truthy check
+        # skipped applying the user-provided threshold when it was ``0`` and
+        # fell back to the default.  Explicitly guard against ``None`` instead
+        # so zero is forwarded correctly.
+        if vad_thr is not None:
             kw["vad_parameters"] = {"threshold": vad_thr}
     if word_ts: kw["word_timestamps"] = True
     return kw
