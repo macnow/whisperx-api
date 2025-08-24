@@ -80,7 +80,7 @@ volumes:
 | `WARMUP_ALIGN_LANGS`        | `en`       | Comma-separated list of language codes to preload alignment models for.                      |
 | `WARMUP_DIARIZE`            | `0`        | `1` → preload the diarization model.                                                         |
 | `ASR_CONFIG_JSON`           | —          | JSON string to configure ASR options per model. See code for default.                        |
-| `DIARIZATION_MODEL`         | -          | Override default diarization model (used when request does not specify `diarization_model`). |
+| `DIARIZATION_MODEL`         | `pyannote/speaker-diarization-3.1` | Override default diarization model (used when request does not specify `diarization_model`). |
 | `HF_HOME`, `XDG_CACHE_HOME` | —          | Override HuggingFace cache location.                                                         |
 
 ⚠️ **TF32 is disabled globally** for reproducibility.
