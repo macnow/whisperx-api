@@ -203,42 +203,41 @@ def load_whisper(model_id: str, asr_options: ASROptions):
     """Return (pipeline, lock); raise 400 offline if model isn’t cached."""
     cache_key = (model_id, asr_options)
     lock_key = str(cache_key)
-    existing = W_CACHE.get(cache_key)
-    if existing:
-        if lock_key not in LOCKS:
-            LOCKS[lock_key] = threading.Lock()
-        return existing, LOCKS[lock_key]
+    lock = LOCKS.setdefault(lock_key, threading.Lock())
+    with lock:
+        existing = W_CACHE.get(cache_key)
+        if existing:
+            return existing, lock
 
-    log_key = f"{model_id} asr_opts={asr_options}"
-    before = free_mb(); _load_start("whisper", log_key)
+        log_key = f"{model_id} asr_opts={asr_options}"
+        before = free_mb(); _load_start("whisper", log_key)
 
-    options_dict = {
-        k: v for k, v in asr_options.__dict__.items()
-        if v is not None and v != 0 and v != 0.0
-    }
+        options_dict = {
+            k: v for k, v in asr_options.__dict__.items()
+            if v is not None and v != 0 and v != 0.0
+        }
 
-    load_kw = dict(
-        compute_type=COMPUTE_TYPE,
-        local_files_only=OFFLINE,
-        device=DEVICE,
-        asr_options=options_dict,
-    )
+        load_kw = dict(
+            compute_type=COMPUTE_TYPE,
+            local_files_only=OFFLINE,
+            device=DEVICE,
+            asr_options=options_dict,
+        )
 
-    if FW_THREADS:
-        load_kw["threads"] = FW_THREADS
+        if FW_THREADS:
+            load_kw["threads"] = FW_THREADS
 
-    try:
-        model = whisperx.load_model(model_id, **load_kw)
-    except LocalEntryNotFoundError:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Model '{model_id}' is not cached locally and "
-                    "LOCAL_ONLY_MODELS=1 prevents downloading.")
-        ) from None
+        try:
+            model = whisperx.load_model(model_id, **load_kw)
+        except LocalEntryNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Model '{model_id}' is not cached locally and "
+                        "LOCAL_ONLY_MODELS=1 prevents downloading.")
+            ) from None
 
-    W_CACHE.put(cache_key, model); _load_end("whisper", log_key, before)
-    LOCKS[lock_key] = threading.Lock()
-    return model, LOCKS[lock_key]
+        W_CACHE.put(cache_key, model); _load_end("whisper", log_key, before)
+    return model, lock
 
 def load_align(lang: str):
     key = lang or "default"
