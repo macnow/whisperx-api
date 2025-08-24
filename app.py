@@ -468,11 +468,18 @@ def build_diar_kwargs(min_spk, max_spk):
     return d
 
 def _fmt(res, fmt):
+    """Format transcription results according to the requested response format."""
+    if isinstance(fmt, ResponseFormat):
+        fmt = fmt.value
     text, seg = res["text"], res["segments"]
-    if fmt == "text": return PlainTextResponse(text)
-    if fmt == "srt":  return PlainTextResponse(srt_from(seg), media_type="text/srt")
-    if fmt == "vtt":  return PlainTextResponse(vtt_from(seg), media_type="text/vtt")
-    if fmt == "verbose_json": return JSONResponse(res)
+    if fmt == "text":
+        return PlainTextResponse(text)
+    if fmt == "srt":
+        return PlainTextResponse(srt_from(seg), media_type="text/srt")
+    if fmt == "vtt":
+        return PlainTextResponse(vtt_from(seg), media_type="text/vtt")
+    if fmt == "verbose_json":
+        return JSONResponse(res)
     return JSONResponse({"text": text})
 
 # ───────── Dependencies ─────────
