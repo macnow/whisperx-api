@@ -74,13 +74,13 @@ volumes:
 | `MODEL_TTL_SEC`             | `600`      | Seconds of inactivity after which a model is evicted from VRAM.                              |
 | `MAX_THREADS`               | `4`        | Size of the ThreadPoolExecutor for blocking work.                                            |
 | `FASTER_WHISPER_THREADS`    | `0`        | Value forwarded to Faster-Whisper `threads` (0 = not passed).                                |
-| `HF_TOKEN`                  | —          | HF access token for private diarisation models.                                              |
+| `HF_TOKEN`                  | —          | HF access token for private diarization models.                                              |
 | `LOCAL_ONLY_MODELS`         | `0`        | `1` → forbid downloads, fail if model not cached.                                            |
 | `WARMUP_MODEL`              | `large-v3` | Whisper model ID to preload on startup.                                                      |
 | `WARMUP_ALIGN_LANGS`        | `en`       | Comma-separated list of language codes to preload alignment models for.                      |
-| `WARMUP_DIARIZE`            | `0`        | `1` → preload the diarisation model.                                                         |
+| `WARMUP_DIARIZE`            | `0`        | `1` → preload the diarization model.                                                         |
 | `ASR_CONFIG_JSON`           | —          | JSON string to configure ASR options per model. See code for default.                        |
-| `DIARIZATION_MODEL`         | -          | Override default diarisation model (used when request does not specify `diarization_model`). |
+| `DIARIZATION_MODEL`         | -          | Override default diarization model (used when request does not specify `diarization_model`). |
 | `HF_HOME`, `XDG_CACHE_HOME` | —          | Override HuggingFace cache location.                                                         |
 
 ⚠️ **TF32 is disabled globally** for reproducibility.
