@@ -420,7 +420,11 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
         whisper, lock = load_whisper(model, asr_options)
         await run_sync(lock.acquire)
         try:
-            raw = await run_sync(whisper.transcribe, wav, **trans_kw)
+            # Forward forced language (if provided) to the transcriber as well
+            transcribe_kw = dict(trans_kw)
+            if lang:
+                transcribe_kw["language"] = lang
+            raw = await run_sync(whisper.transcribe, wav, **transcribe_kw)
         finally:
             lock.release()
         res = standardize(raw)
