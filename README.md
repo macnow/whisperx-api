@@ -1,9 +1,14 @@
-# WhisperX Transcription API · v1.8.9
+# WhisperX Transcription API · v1.9.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.9.0  (2025-09-08)
+
+* Minor release: formalizes recent improvements (1.8.9) under 1.9.0.
+* No additional functional changes beyond 1.8.9.
 
 ## What’s new in 1.8.9  (2025-09-08)
 

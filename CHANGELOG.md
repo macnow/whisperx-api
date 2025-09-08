@@ -4,6 +4,12 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.9.0] – 2025-09-08
+### Changed
+- Minor release: promote 1.8.9 changes under 1.9.0. No additional changes.
+
+---
+
 ## [1.8.9] – 2025-09-08
 ### Added
 - Forward explicit `language` argument into `whisper.transcribe` so client-forced
