@@ -4,6 +4,21 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.8.9] – 2025-09-08
+### Added
+- Forward explicit `language` argument into `whisper.transcribe` so client-forced
+  language is honored.
+
+### Changed
+- Serialized Whisper model loading to avoid concurrent initializations.
+
+### Fixed
+- Corrected TTL cache `get` semantics.
+- Handled zero VAD threshold correctly.
+- Fixed response format detection.
+
+---
+
 ## [1.8.8] - 2025-08-24
 ### Added
 - **Per-request diarisation model selection** – new form field  
