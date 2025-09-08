@@ -424,6 +424,11 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
             transcribe_kw = dict(trans_kw)
             if lang:
                 transcribe_kw["language"] = lang
+            else:
+                # Make explicit in logs that autodetect is being used
+                _log("transcribe_opts", fname, "lang=auto")
+            if lang:
+                _log("transcribe_opts", fname, "lang=%s", lang)
             raw = await run_sync(whisper.transcribe, wav, **transcribe_kw)
         finally:
             lock.release()
@@ -529,8 +534,12 @@ async def transcriptions(
     with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
         tmp.write(await file.read())
         tmp.flush()
+        # Sanitize language: treat empty strings or 'auto'/'detect' as None
+        lang = (language or "").strip() or None
+        if lang and lang.lower() in ("auto", "detect", "autodetect"):
+            lang = None
         res = await process(
-            tmp.name, params["model"], language, params["align"], params["diarize"],
+            tmp.name, params["model"], lang, params["align"], params["diarize"],
             build_transcribe_kwargs(
                 params["batch_size"], params["word_timestamps"],
                 params["vad_filter"], params["vad_threshold"]),
