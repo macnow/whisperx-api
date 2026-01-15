@@ -24,6 +24,8 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get purge -y unzip && apt-get autoremove -y && \
     rm -rf /wheels
 
+RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt_tab
+
 # Copy the API code
 COPY app.py /app/app.py
 RUN chmod 775 /app/app.py
