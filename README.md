@@ -1,9 +1,26 @@
-# WhisperX Transcription API · v1.9.0
+# WhisperX Transcription API · v1.10.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.10.0  (2026-04-22)
+
+* **Concurrent transcriptions on a single GPU.** Each `(model, asr_options)`
+  pair now backs a *pool* of N WhisperX instances (`TRANSCRIBE_CONCURRENCY`,
+  default `1`). Several requests for the same model now run truly in parallel
+  on big GPUs (e.g. L40s with 48 GB VRAM can comfortably hold 3–5 large-v3
+  instances).
+* **Event-loop never blocks.** All model loading (whisper / align / diarize)
+  is offloaded to the thread pool and guarded by `asyncio.Lock` instead of
+  `threading.Lock`. The previous design synchronously acquired a thread lock
+  inside the async handler, which froze the whole server while another
+  request was transcribing. Health-checks, `/v1/models` and other endpoints
+  now stay responsive under load.
+* `whisperx.load_audio` is also offloaded to the worker pool.
+* Pool TTL eviction: when every instance of a pool is idle longer than
+  `MODEL_TTL_SEC`, the whole pool is unloaded and VRAM freed.
 
 ## What’s new in 1.9.0  (2025-09-08)
 
@@ -87,6 +104,7 @@ volumes:
 | --------------------------- | ---------- | -------------------------------------------------------------------------------------------- |
 | `MODEL_TTL_SEC`             | `600`      | Seconds of inactivity after which a model is evicted from VRAM.                              |
 | `MAX_THREADS`               | `4`        | Size of the ThreadPoolExecutor for blocking work.                                            |
+| `TRANSCRIBE_CONCURRENCY`    | `1`        | Number of warm Whisper instances per `(model, asr_options)` pool. Increase on big GPUs (L40s: 3-5 for large-v3). |
 | `FASTER_WHISPER_THREADS`    | `0`        | Value forwarded to Faster-Whisper `threads` (0 = not passed).                                |
 | `HF_TOKEN`                  | —          | HF access token for private diarization models.                                              |
 | `LOCAL_ONLY_MODELS`         | `0`        | `1` → forbid downloads, fail if model not cached.                                            |
