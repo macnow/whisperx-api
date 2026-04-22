@@ -87,7 +87,7 @@ def test_get_updates_timestamp():
 
 
 def test_sweep_removes_expired(monkeypatch):
-    cache = TTLCache("whisper")
+    cache = TTLCache("align")
     cache.put("old", 1)
     cache.put("fresh", 2)
     # Make "old" entry appear expired

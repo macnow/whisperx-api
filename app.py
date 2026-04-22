@@ -1,9 +1,10 @@
 """
-WhisperX Transcription API · v1.9.0
+WhisperX Transcription API · v1.10.0
 (OpenAI-compatible)
 
 •  GPU-only WhisperX wrapper with optional alignment & diarisation
-•  One GPU instance per model, thread-safe, TTL-based eviction
+•  Pool of N instances per model (TRANSCRIBE_CONCURRENCY) – true parallel
+   transcriptions on a single big GPU (e.g. L40s); TTL-based eviction
 •  Detailed logging (freeVRAM, used=±MB, step timings)
 •  `/v1/models`
       – online:  every Faster-Whisper variant + "downloaded" flag
@@ -13,6 +14,7 @@ WhisperX Transcription API · v1.9.0
 """
 
 # ───────── CUDA / TF32 OFF ─────────
+import contextlib
 import json
 import os, time, logging, threading, tempfile, gc, torch, asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +22,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import whisperx, srt, webvtt
 from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
@@ -133,6 +135,7 @@ OFFLINE  = os.getenv("LOCAL_ONLY_MODELS", "0") == "1"
 TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "").strip() or None
+TRANSCRIBE_CONCURRENCY = max(1, int(os.getenv("TRANSCRIBE_CONCURRENCY", "1")))
 
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -154,13 +157,13 @@ DEFAULT_ASR_CONFIG = {
 ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
 ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
-app = FastAPI(title="WhisperX Transcription API", version="1.9.0")
+app = FastAPI(title="WhisperX Transcription API", version="1.10.0")
 
 @app.on_event("startup")
 async def on_startup():
-    warmup()
+    await warmup()
 
-# ───────── TTL caches ─────────
+# ───────── TTL caches (align / diarize) ─────────
 class TTLCache(dict):
     """Dict with TTL eviction & VRAM-usage logging."""
     def __init__(self, label: str): super().__init__(); self.label = label
@@ -176,12 +179,108 @@ class TTLCache(dict):
         for k, (_, ts) in list(self.items()):
             if now - ts > ttl:
                 del self[k]; torch.cuda.empty_cache()
-                key = {"whisper": "model", "align": "lang", "diarize": "model"}[self.label]
+                key = {"align": "lang", "diarize": "model"}[self.label]
                 logging.info("[%s_model_unload]  %s=%s  freeVRAM=%d MB",
                              self.label, key, k, free_mb())
 
-W_CACHE, A_CACHE, D_CACHE = TTLCache("whisper"), TTLCache("align"), TTLCache("diarize")
-LOCKS: Dict[str, threading.Lock] = {}
+A_CACHE, D_CACHE = TTLCache("align"), TTLCache("diarize")
+
+# ───────── Whisper instance pools ─────────
+class WhisperPool:
+    """Pool of N whisper instances for one (model_id, asr_options) key.
+
+    - `asyncio.Lock` serialises concurrent first-loads (so 5 simultaneous
+      cold requests don't all try to load the model 5 times).
+    - `asyncio.Queue` holds the warm instances; `acquire()` is an async
+      context manager that hands one out and returns it on exit.
+    - `last_used` is bumped on every acquire/release; the sweeper evicts the
+      whole pool when it has been idle for `MODEL_TTL_SEC`.
+    """
+
+    def __init__(self, cache_key: Tuple[str, "ASROptions"], size: int):
+        self.cache_key = cache_key
+        self.model_id = cache_key[0]
+        self.asr_options = cache_key[1]
+        self.size = size
+        self.instances: list = []
+        self.available: asyncio.Queue = asyncio.Queue()
+        self.load_lock = asyncio.Lock()
+        self.last_used = time.time()
+
+    def _load_one(self):
+        options_dict = {
+            k: v for k, v in self.asr_options.__dict__.items()
+            if v is not None and v != 0 and v != 0.0
+        }
+        load_kw = dict(
+            compute_type=COMPUTE_TYPE,
+            local_files_only=OFFLINE,
+            device=DEVICE,
+            asr_options=options_dict,
+        )
+        if FW_THREADS:
+            load_kw["threads"] = FW_THREADS
+        try:
+            return whisperx.load_model(self.model_id, **load_kw)
+        except LocalEntryNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Model '{self.model_id}' is not cached locally and "
+                        "LOCAL_ONLY_MODELS=1 prevents downloading.")
+            ) from None
+
+    async def ensure_loaded(self):
+        """Make sure the pool has `size` instances. Safe under concurrency."""
+        if len(self.instances) >= self.size:
+            return
+        async with self.load_lock:
+            while len(self.instances) < self.size:
+                idx = len(self.instances) + 1
+                log_key = f"{self.model_id} #{idx}/{self.size} asr_opts={self.asr_options}"
+                before = free_mb(); _load_start("whisper", log_key)
+                model = await run_sync(self._load_one)
+                self.instances.append(model)
+                await self.available.put(model)
+                _load_end("whisper", log_key, before)
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        await self.ensure_loaded()
+        model = await self.available.get()
+        self.last_used = time.time()
+        try:
+            yield model
+        finally:
+            self.last_used = time.time()
+            await self.available.put(model)
+
+    def is_idle(self) -> bool:
+        """True iff every instance is in the available queue (no one using)."""
+        return self.available.qsize() == len(self.instances) == self.size
+
+    def evict(self):
+        """Drop all model references; caller must ensure no one is using them."""
+        self.instances.clear()
+        # drain queue
+        try:
+            while True:
+                self.available.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+
+WHISPER_POOLS: Dict[Tuple[str, "ASROptions"], WhisperPool] = {}
+_POOLS_LOCK = threading.Lock()  # protects WHISPER_POOLS dict mutations only
+
+def get_whisper_pool(model_id: str, asr_options: "ASROptions") -> WhisperPool:
+    """Return (creating if needed) the pool for this (model, options) key."""
+    cache_key = (model_id, asr_options)
+    with _POOLS_LOCK:
+        pool = WHISPER_POOLS.get(cache_key)
+        if pool is None:
+            pool = WhisperPool(cache_key, TRANSCRIBE_CONCURRENCY)
+            WHISPER_POOLS[cache_key] = pool
+        return pool
 
 # ───────── Logging helpers ─────────
 def _log(tag: str, fname: str, msg: str = "", *a):
@@ -199,71 +298,58 @@ def _load_end(lbl: str, key: str, before: int):
                  key, delta, free_mb())
 
 # ───────── Loaders ─────────
-def load_whisper(model_id: str, asr_options: ASROptions):
-    """Return (pipeline, lock); raise 400 offline if model isn’t cached."""
-    cache_key = (model_id, asr_options)
-    lock_key = str(cache_key)
-    lock = LOCKS.setdefault(lock_key, threading.Lock())
-    with lock:
-        existing = W_CACHE.get(cache_key)
-        if existing:
-            return existing, lock
+# Async-safe locks – protect first-time load from event-loop blocking and
+# concurrent double initialisation.  The actual load is offloaded to a
+# worker thread via run_sync so the event loop stays responsive.
+_ALIGN_LOAD_LOCKS: Dict[str, asyncio.Lock] = {}
+_DIAR_LOAD_LOCKS: Dict[str, asyncio.Lock] = {}
+_LOADERS_DICT_LOCK = threading.Lock()  # guards dict mutations only
 
-        log_key = f"{model_id} asr_opts={asr_options}"
-        before = free_mb(); _load_start("whisper", log_key)
+def _get_async_lock(d: Dict[str, asyncio.Lock], key: str) -> asyncio.Lock:
+    with _LOADERS_DICT_LOCK:
+        lock = d.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            d[key] = lock
+        return lock
 
-        options_dict = {
-            k: v for k, v in asr_options.__dict__.items()
-            if v is not None and v != 0 and v != 0.0
-        }
-
-        load_kw = dict(
-            compute_type=COMPUTE_TYPE,
-            local_files_only=OFFLINE,
-            device=DEVICE,
-            asr_options=options_dict,
-        )
-
-        if FW_THREADS:
-            load_kw["threads"] = FW_THREADS
-
-        try:
-            model = whisperx.load_model(model_id, **load_kw)
-        except LocalEntryNotFoundError:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"Model '{model_id}' is not cached locally and "
-                        "LOCAL_ONLY_MODELS=1 prevents downloading.")
-            ) from None
-
-        W_CACHE.put(cache_key, model); _load_end("whisper", log_key, before)
-    return model, lock
-
-def load_align(lang: str):
+async def load_align(lang: str):
     key = lang or "default"
     pair = A_CACHE.get(key)
-    if pair: return pair
-    before = free_mb(); _load_start("align", key)
-    model, meta = whisperx.load_align_model(language_code=lang or "en", device=DEVICE)
-    A_CACHE.put(key, (model, meta)); _load_end("align", key, before)
-    return model, meta
+    if pair:
+        return pair
+    async with _get_async_lock(_ALIGN_LOAD_LOCKS, key):
+        pair = A_CACHE.get(key)  # re-check inside lock
+        if pair:
+            return pair
+        before = free_mb(); _load_start("align", key)
+        model, meta = await run_sync(
+            whisperx.load_align_model, language_code=lang or "en", device=DEVICE)
+        A_CACHE.put(key, (model, meta)); _load_end("align", key, before)
+        return model, meta
 
-def load_diar(model_name: str | None = None):
+async def load_diar(model_name: str | None = None):
     """Load diarization pipeline; cache per model name."""
     diar_model_name = model_name or DIARIZATION_MODEL or "pyannote/speaker-diarization-3.1"
     pip = D_CACHE.get(diar_model_name)
-    if pip: return pip
-    before = free_mb(); _load_start("diarize", diar_model_name)
-    try:
-        from whisperx.diarize import DiarizationPipeline as _DP
-    except ImportError:
-        from whisperx.diarization import DiarizationPipeline as _DP
-    pip = _DP(model_name=diar_model_name, use_auth_token=HF_TOKEN, device=DEVICE)
-    D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
-    return pip
+    if pip:
+        return pip
+    async with _get_async_lock(_DIAR_LOAD_LOCKS, diar_model_name):
+        pip = D_CACHE.get(diar_model_name)  # re-check inside lock
+        if pip:
+            return pip
+        before = free_mb(); _load_start("diarize", diar_model_name)
+        try:
+            from whisperx.diarize import DiarizationPipeline as _DP
+        except ImportError:
+            from whisperx.diarization import DiarizationPipeline as _DP
+        pip = await run_sync(
+            _DP, model_name=diar_model_name, use_auth_token=HF_TOKEN, device=DEVICE)
+        D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
+        return pip
 
 # ───────── Warmup ─────────
-def warmup():
+async def warmup():
     """Pre-loads default models for faster first-request processing."""
     logging.info("Warming up...")
     if WARMUP_MODEL not in _MODELS:
@@ -277,18 +363,22 @@ def warmup():
         length_penalty=asr_config.get("length_penalty"),
         best_of=asr_config.get("best_of"),
     )
-    load_whisper(WARMUP_MODEL, asr_options)
+    await get_whisper_pool(WARMUP_MODEL, asr_options).ensure_loaded()
 
     for lang in WARMUP_ALIGN_LANGS:
-        if lang: load_align(lang)
+        if lang:
+            await load_align(lang)
     if WARMUP_DIARIZE:
-        load_diar()
+        await load_diar()
     logging.info("Warmup complete.")
 
 # ───────── /v1/models ─────────
 def is_cached(mid: str) -> bool:
-    # Note: quick heuristic; W_CACHE keys include ASR options so this isn't exhaustive.
-    return mid in local_sizes() or any(isinstance(k, tuple) and k[0] == mid for k in W_CACHE.keys())
+    # Disk cache OR a pool already has at least one loaded instance.
+    if mid in local_sizes():
+        return True
+    return any(key[0] == mid and pool.instances
+               for key, pool in WHISPER_POOLS.items())
 
 @app.get("/v1/models")
 def models():
@@ -389,17 +479,40 @@ def vtt_from(seg):
     return v.content
 
 # ───────── Sweeper thread ─────────
+def _sweep_pools():
+    """Evict whisper pools that have been idle longer than TTL_SEC."""
+    now = time.time()
+    with _POOLS_LOCK:
+        keys = list(WHISPER_POOLS.keys())
+    for key in keys:
+        pool = WHISPER_POOLS.get(key)
+        if pool is None:
+            continue
+        if now - pool.last_used <= TTL_SEC:
+            continue
+        if not pool.is_idle():
+            continue
+        with _POOLS_LOCK:
+            # re-check under lock; another thread may have just acquired
+            if pool.is_idle() and now - pool.last_used > TTL_SEC:
+                WHISPER_POOLS.pop(key, None)
+                pool.evict()
+                torch.cuda.empty_cache()
+                logging.info("[whisper_pool_unload]  model=%s  size=%d  freeVRAM=%d MB",
+                             pool.model_id, pool.size, free_mb())
+
 def _sweep():
     while True:
         time.sleep(60)
-        W_CACHE.sweep(TTL_SEC); A_CACHE.sweep(TTL_SEC); D_CACHE.sweep(TTL_SEC); gc.collect()
+        _sweep_pools()
+        A_CACHE.sweep(TTL_SEC); D_CACHE.sweep(TTL_SEC); gc.collect()
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_model_name: str | None):
     fname = Path(path).name
     try:
-        wav = whisperx.load_audio(path)
+        wav = await run_sync(whisperx.load_audio, path)
     except Exception as e:
         logging.error("Error loading audio file %s: %s", fname, e, exc_info=True)
         raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
@@ -417,21 +530,15 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
             length_penalty=asr_config.get("length_penalty"),
             best_of=asr_config.get("best_of"),
         )
-        whisper, lock = load_whisper(model, asr_options)
-        await run_sync(lock.acquire)
-        try:
-            # Forward forced language (if provided) to the transcriber as well
+        pool = get_whisper_pool(model, asr_options)
+        async with pool.acquire() as whisper:
             transcribe_kw = dict(trans_kw)
             if lang:
                 transcribe_kw["language"] = lang
-            else:
-                # Make explicit in logs that autodetect is being used
-                _log("transcribe_opts", fname, "lang=auto")
-            if lang:
                 _log("transcribe_opts", fname, "lang=%s", lang)
+            else:
+                _log("transcribe_opts", fname, "lang=auto")
             raw = await run_sync(whisper.transcribe, wav, **transcribe_kw)
-        finally:
-            lock.release()
         res = standardize(raw)
         _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
@@ -439,7 +546,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
         if do_align:
             t = time.perf_counter(); lang_used = res.get("language") or lang
             _log("align_start", fname, "lang=%s", lang_used)
-            model_a, meta = load_align(lang_used)
+            model_a, meta = await load_align(lang_used)
             res = standardize(await run_sync(
                 whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
             _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
@@ -447,12 +554,14 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
         # diarisation
         if do_diar:
             t = time.perf_counter(); _log("diarize_start", fname)
-            diar_pipe = load_diar(diar_model_name)
+            diar_pipe = await load_diar(diar_model_name)
             spk = await run_sync(diar_pipe, wav, **diar_kw)
             res = standardize(await run_sync(
                 whisperx.assign_word_speakers, spk, res), spk=True)
             _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error during processing: {e}")

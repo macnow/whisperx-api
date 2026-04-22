@@ -4,6 +4,32 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.10.0] – 2026-04-22
+### Added
+- New `TRANSCRIBE_CONCURRENCY` environment variable (default `1`). Each
+  `(model, asr_options)` key is now backed by a pool of N warm WhisperX
+  instances, enabling true parallel transcriptions on a single large GPU.
+- Pool TTL eviction: a whole pool is unloaded once every instance has been
+  idle for `MODEL_TTL_SEC`.
+
+### Fixed
+- **Server hang under concurrent requests.** The previous implementation
+  acquired a `threading.Lock` synchronously from inside the async handler.
+  When one request was transcribing (holding the lock in a worker thread),
+  any second request to the same model blocked the asyncio event loop for
+  the entire transcription, freezing the whole server (including health
+  checks and `/v1/models`).
+- All model loading (whisper / align / diarize) and `whisperx.load_audio`
+  are now offloaded to the worker thread pool. Loading is serialised per
+  key with `asyncio.Lock`, never blocking the event loop.
+
+### Changed
+- `load_align` and `load_diar` are now `async`.
+- Removed the per-instance `threading.Lock` (`LOCKS` dict) and the global
+  `W_CACHE` (replaced by `WHISPER_POOLS`).
+
+---
+
 ## [1.9.0] – 2025-09-08
 ### Changed
 - Minor release: promote 1.8.9 changes under 1.9.0. No additional changes.
