@@ -4,6 +4,16 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.11.0] – 2026-04-22
+### Added
+- OpenAI-compatible `usage` object on JSON responses
+  (`{"type": "duration", "seconds": <audio_seconds>}`), matching the
+  *duration* variant returned by OpenAI's `gpt-4o-transcribe` endpoint.
+- `verbose_json` now also exposes top-level `duration` (audio seconds),
+  matching OpenAI `whisper-1`.
+
+---
+
 ## [1.10.0] – 2026-04-22
 ### Added
 - New `TRANSCRIBE_CONCURRENCY` environment variable (default `1`). Each

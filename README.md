@@ -1,9 +1,26 @@
-# WhisperX Transcription API · v1.10.0
+# WhisperX Transcription API · v1.11.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.11.0  (2026-04-22)
+
+* **OpenAI-compatible `usage` field.** JSON responses (`json` and
+  `verbose_json`) now include a `usage` object matching OpenAI's
+  `gpt-4o-transcribe` *duration* variant:
+
+  ```json
+  {
+    "text": "...",
+    "usage": { "type": "duration", "seconds": 12.34 }
+  }
+  ```
+
+  `verbose_json` additionally exposes `duration` at the top level (matching
+  OpenAI `whisper-1`). `seconds` is the audio duration, not wall-clock
+  processing time. Plain-text formats (`text`, `srt`, `vtt`) are unchanged.
 
 ## What’s new in 1.10.0  (2026-04-22)
 
