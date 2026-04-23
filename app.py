@@ -344,14 +344,19 @@ async def load_diar(model_name: str | None = None):
             from whisperx.diarize import DiarizationPipeline as _DP
         except ImportError:
             from whisperx.diarization import DiarizationPipeline as _DP
+
         def _make_diar_pipeline():
-            # `use_auth_token` was renamed to `hf_token` in newer WhisperX;
-            # try the new name first and fall back for older installs.
+            # WhisperX renamed the HF token kwarg across versions:
+            #   old: use_auth_token  →  newer: hf_token  →  current: token
+            # Try each in order, fall back gracefully.
             kw = dict(model_name=diar_model_name, device=DEVICE)
-            try:
-                return _DP(hf_token=HF_TOKEN, **kw)
-            except TypeError:
-                return _DP(use_auth_token=HF_TOKEN, **kw)
+            for token_kwarg in ("token", "hf_token", "use_auth_token"):
+                try:
+                    return _DP(**{token_kwarg: HF_TOKEN}, **kw)
+                except TypeError:
+                    continue
+            # Last resort: no token kwarg at all (public models)
+            return _DP(**kw)
 
         pip = await run_sync(_make_diar_pipeline)
         D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
