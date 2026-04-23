@@ -345,17 +345,25 @@ async def load_diar(model_name: str | None = None):
         except ImportError:
             from whisperx.diarization import DiarizationPipeline as _DP
 
+        # Pyannote historically stored models under TORCH_HOME/pyannote.
+        # Newer WhisperX switched to the standard HF hub cache. Pass the
+        # legacy path as cache_dir so both old and new layouts work.
+        torch_home = os.environ.get("TORCH_HOME") or os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "torch")
+        pyannote_cache = os.path.join(torch_home, "pyannote")
+
         def _make_diar_pipeline():
             # WhisperX renamed the HF token kwarg across versions:
             #   old: use_auth_token  →  newer: hf_token  →  current: token
             # Try each in order, fall back gracefully.
             kw = dict(model_name=diar_model_name, device=DEVICE)
+            # Pass cache_dir only if the new API supports it
             for token_kwarg in ("token", "hf_token", "use_auth_token"):
-                try:
-                    return _DP(**{token_kwarg: HF_TOKEN}, **kw)
-                except TypeError:
-                    continue
-            # Last resort: no token kwarg at all (public models)
+                for extra in ({"cache_dir": pyannote_cache}, {}):
+                    try:
+                        return _DP(**{token_kwarg: HF_TOKEN}, **extra, **kw)
+                    except TypeError:
+                        continue
             return _DP(**kw)
 
         try:
