@@ -358,32 +358,55 @@ async def load_diar(model_name: str | None = None):
             # Last resort: no token kwarg at all (public models)
             return _DP(**kw)
 
-        pip = await run_sync(_make_diar_pipeline)
+        try:
+            pip = await run_sync(_make_diar_pipeline)
+        except LocalEntryNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Diarization model '{diar_model_name}' is not cached locally and "
+                        "LOCAL_ONLY_MODELS=1 prevents downloading.")
+            ) from None
         D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
         return pip
 
 # ───────── Warmup ─────────
 async def warmup():
-    """Pre-loads default models for faster first-request processing."""
+    """Pre-loads default models for faster first-request processing.
+
+    Failures on individual steps are logged as warnings and never crash the
+    server – a missing model during warmup is recoverable (it will be loaded
+    on first request, or fail there with a proper HTTP 400/500).
+    """
     logging.info("Warming up...")
     if WARMUP_MODEL not in _MODELS:
         logging.warning("WARMUP_MODEL '%s' not found in _MODELS, skipping.", WARMUP_MODEL)
-        return
-
-    asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
-    asr_options = ASROptions(
-        beam_size=asr_config.get("beam_size"),
-        patience=asr_config.get("patience"),
-        length_penalty=asr_config.get("length_penalty"),
-        best_of=asr_config.get("best_of"),
-    )
-    await get_whisper_pool(WARMUP_MODEL, asr_options).ensure_loaded()
+    else:
+        asr_config = ASR_CONFIG.get(WARMUP_MODEL, {})
+        asr_options = ASROptions(
+            beam_size=asr_config.get("beam_size"),
+            patience=asr_config.get("patience"),
+            length_penalty=asr_config.get("length_penalty"),
+            best_of=asr_config.get("best_of"),
+        )
+        try:
+            await get_whisper_pool(WARMUP_MODEL, asr_options).ensure_loaded()
+        except Exception as e:
+            logging.warning("Warmup: failed to load whisper model '%s': %s", WARMUP_MODEL, e)
 
     for lang in WARMUP_ALIGN_LANGS:
-        if lang:
+        if not lang:
+            continue
+        try:
             await load_align(lang)
+        except Exception as e:
+            logging.warning("Warmup: failed to load align model for lang '%s': %s", lang, e)
+
     if WARMUP_DIARIZE:
-        await load_diar()
+        try:
+            await load_diar()
+        except Exception as e:
+            logging.warning("Warmup: failed to load diarization model: %s", e)
+
     logging.info("Warmup complete.")
 
 # ───────── /v1/models ─────────
