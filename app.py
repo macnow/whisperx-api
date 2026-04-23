@@ -638,8 +638,12 @@ def build_diar_kwargs(min_spk, max_spk):
     return d
 
 def _usage(res):
-    """OpenAI-compatible usage object (duration variant, in seconds)."""
-    return {"type": "duration", "seconds": res.get("duration", 0)}
+    """OpenAI-compatible usage object (duration variant, in seconds).
+
+    LiteLLM's TranscriptionUsageDurationObject validates `seconds` as int,
+    so we round up to avoid a ValidationError on fractional durations.
+    """
+    return {"type": "duration", "seconds": int(res.get("duration", 0)) + 1}
 
 def _fmt(res, fmt):
     """Format transcription results according to the requested response format."""
