@@ -344,8 +344,16 @@ async def load_diar(model_name: str | None = None):
             from whisperx.diarize import DiarizationPipeline as _DP
         except ImportError:
             from whisperx.diarization import DiarizationPipeline as _DP
-        pip = await run_sync(
-            _DP, model_name=diar_model_name, use_auth_token=HF_TOKEN, device=DEVICE)
+        def _make_diar_pipeline():
+            # `use_auth_token` was renamed to `hf_token` in newer WhisperX;
+            # try the new name first and fall back for older installs.
+            kw = dict(model_name=diar_model_name, device=DEVICE)
+            try:
+                return _DP(hf_token=HF_TOKEN, **kw)
+            except TypeError:
+                return _DP(use_auth_token=HF_TOKEN, **kw)
+
+        pip = await run_sync(_make_diar_pipeline)
         D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
         return pip
 
