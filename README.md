@@ -1,9 +1,15 @@
-# WhisperX Transcription API · v1.12.0
+# WhisperX Transcription API · v1.12.1
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.12.1  (2026-09-09)
+
+* **Fixed Docker build.** The upstream `ghcr.io/jim60105/whisperx:no_model`
+  base image bumped Python 3.11 → 3.13; the Dockerfile's wheel-builder stage
+  and hardcoded `site-packages` paths now target Python 3.13 to match.
 
 ## What’s new in 1.12.0  (2026-09-09)
 

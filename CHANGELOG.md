@@ -4,6 +4,18 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.12.1] – 2026-09-09
+### Fixed
+- Docker build was broken because the upstream base image
+  `ghcr.io/jim60105/whisperx:no_model` bumped its Python version from 3.11
+  to 3.13 (its venv now lives at `/venv/lib/python3.13/site-packages`), so
+  our `cp -r /wheels/* /venv/lib/python3.11/site-packages/` step failed with
+  "No such file or directory". Updated the wheel-builder stage to
+  `python:3.13-slim` and all `python3.11` paths/env vars to `python3.13` to
+  match the new base image.
+
+---
+
 ## [1.12.0] – 2026-09-09
 ### Added
 - `GET /metrics` Prometheus endpoint (`prometheus-client`):

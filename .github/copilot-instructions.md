@@ -20,7 +20,8 @@ Docker image built from `Dockerfile`.
   to install real GPU dependencies.
 - Run all tests: `python -m pytest tests/ -q`
 - Run a single test: `python -m pytest tests/test_ttlcache.py::test_sweep_removes_expired -q`
-- Requires Python **3.11** (matches the `Dockerfile` builder stage); the
+- Requires Python **3.13** (matches the `Dockerfile` builder stage and the
+  `ghcr.io/jim60105/whisperx:no_model` base image's venv); the
   `int | None` style annotations used throughout `app.py` fail to import on
   Python 3.9/3.10.
 - If a test run needs packages not present locally (`pytest`,

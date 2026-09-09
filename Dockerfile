@@ -8,7 +8,7 @@ USER root
 WORKDIR /wheels
 
 # ===== Intermediate build stage for packages =====
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 # Download the wheel files
 RUN pip install --target=/tmp/wheels fastapi uvicorn python-multipart srt webvtt-py prometheus-client
@@ -20,7 +20,7 @@ FROM base
 COPY --from=builder /tmp/wheels /wheels
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends unzip && \
-    cp -r /wheels/* /venv/lib/python3.11/site-packages/ && \
+    cp -r /wheels/* /venv/lib/python3.13/site-packages/ && \
     apt-get purge -y unzip && apt-get autoremove -y && \
     rm -rf /wheels
 
@@ -35,7 +35,7 @@ EXPOSE 8000
 
 # Set the environment and entrypoint
 ENV PATH="/venv/bin:${PATH}"
-ENV PYTHONPATH="/venv/lib/python3.11/site-packages"
+ENV PYTHONPATH="/venv/lib/python3.13/site-packages"
 
 ENV XDG_CACHE_HOME=/root/.cache
 ENV HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub
