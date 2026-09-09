@@ -4,6 +4,21 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.12.0] – 2026-09-09
+### Added
+- `GET /metrics` Prometheus endpoint (`prometheus-client`):
+  - `whisperx_requests_total` / `whisperx_request_duration_seconds` per endpoint.
+  - `whisperx_transcribe_speed_ratio` – realtime factor (`audio_s/wall_s`) of
+    `whisper.transcribe`, labeled by `model` and by the executor thread that
+    ran it, to observe per-thread throughput under `TRANSCRIBE_CONCURRENCY`.
+  - `whisperx_transcribe_thread_seconds_total`, `whisperx_audio_seconds_total`.
+  - `whisperx_active_transcriptions`, `whisperx_model_pool_instances`,
+    `whisperx_model_pool_available`, `whisperx_gpu_free_memory_mb`.
+  - `whisperx_errors_total{stage}`.
+- `.github/copilot-instructions.md` documenting architecture/conventions.
+
+---
+
 ## [1.11.0] – 2026-04-22
 ### Added
 - OpenAI-compatible `usage` object on JSON responses

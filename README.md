@@ -1,9 +1,17 @@
-# WhisperX Transcription API · v1.11.0
+# WhisperX Transcription API · v1.12.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.12.0  (2026-09-09)
+
+* **`GET /metrics` Prometheus endpoint.** Request counts/latency per
+  endpoint, per-thread transcription speed ratio
+  (`whisperx_transcribe_speed_ratio`, `audio_s/wall_s` labeled by `model`
+  and executor thread), active transcriptions, whisper pool sizes, free
+  GPU memory, and error counters. See "Metrics" below.
 
 ## What’s new in 1.11.0  (2026-04-22)
 

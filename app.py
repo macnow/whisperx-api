@@ -1,5 +1,5 @@
 """
-WhisperX Transcription API · v1.11.0
+WhisperX Transcription API · v1.12.0
 (OpenAI-compatible)
 
 •  GPU-only WhisperX wrapper with optional alignment & diarisation
@@ -159,7 +159,7 @@ DEFAULT_ASR_CONFIG = {
 ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
 ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
-app = FastAPI(title="WhisperX Transcription API", version="1.11.0")
+app = FastAPI(title="WhisperX Transcription API", version="1.12.0")
 
 @app.on_event("startup")
 async def on_startup():
