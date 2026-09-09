@@ -11,7 +11,7 @@ WORKDIR /wheels
 FROM python:3.11-slim AS builder
 
 # Download the wheel files
-RUN pip install --target=/tmp/wheels fastapi uvicorn python-multipart srt webvtt-py
+RUN pip install --target=/tmp/wheels fastapi uvicorn python-multipart srt webvtt-py prometheus-client
 
 # ===== Final stage =====
 FROM base

@@ -13,3 +13,6 @@ webvtt-py
 
 # Hugging Face Hub for model management
 huggingface-hub
+
+# Prometheus metrics
+prometheus-client

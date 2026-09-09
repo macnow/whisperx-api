@@ -27,9 +27,10 @@ from typing import Dict, Any, Tuple
 
 import whisperx, srt, webvtt
 from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from huggingface_hub.errors import LocalEntryNotFoundError
 from urllib.parse import quote_plus
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)8s  %(message)s")
@@ -163,6 +164,59 @@ app = FastAPI(title="WhisperX Transcription API", version="1.11.0")
 @app.on_event("startup")
 async def on_startup():
     await warmup()
+
+# ───────── Prometheus metrics ─────────
+# Request-level metrics
+REQUESTS_TOTAL = Counter(
+    "whisperx_requests_total", "Total HTTP requests processed.",
+    ["endpoint", "response_format", "status"])
+REQUEST_DURATION = Histogram(
+    "whisperx_request_duration_seconds", "End-to-end request wall time.",
+    ["endpoint"])
+ACTIVE_TRANSCRIPTIONS = Gauge(
+    "whisperx_active_transcriptions", "Requests currently being processed.")
+ERRORS_TOTAL = Counter(
+    "whisperx_errors_total", "Errors raised while processing a request.",
+    ["stage"])
+
+# Per-thread transcription performance: how fast is each worker thread
+# actually transcribing, in "audio seconds processed per wall second"
+# (realtime factor). This is what tells you whether adding more
+# TRANSCRIBE_CONCURRENCY instances is actually paying off on a given GPU,
+# as opposed to just measuring wall-clock latency per request.
+TRANSCRIBE_SPEED_RATIO = Histogram(
+    "whisperx_transcribe_speed_ratio",
+    "Realtime factor (audio_seconds / wall_seconds) of the whisper.transcribe "
+    "call, labeled by the executor thread that ran it.",
+    ["model", "thread"],
+    buckets=(1, 2, 4, 6, 8, 10, 15, 20, 30, 50, 75, 100))
+TRANSCRIBE_THREAD_SECONDS = Counter(
+    "whisperx_transcribe_thread_seconds_total",
+    "Cumulative wall time spent transcribing, per executor thread.",
+    ["model", "thread"])
+AUDIO_SECONDS_TOTAL = Counter(
+    "whisperx_audio_seconds_total", "Cumulative audio seconds transcribed.",
+    ["model"])
+
+# Resource / pool gauges
+GPU_FREE_MEMORY_MB = Gauge(
+    "whisperx_gpu_free_memory_mb", "Free CUDA memory as last observed.")
+MODEL_POOL_SIZE = Gauge(
+    "whisperx_model_pool_instances", "Loaded whisper instances per model pool.",
+    ["model"])
+MODEL_POOL_AVAILABLE = Gauge(
+    "whisperx_model_pool_available", "Idle (unused) whisper instances per model pool.",
+    ["model"])
+
+@app.get("/metrics")
+def metrics():
+    GPU_FREE_MEMORY_MB.set(free_mb())
+    with _POOLS_LOCK:
+        pools = list(WHISPER_POOLS.values())
+    for pool in pools:
+        MODEL_POOL_SIZE.labels(model=pool.model_id).set(len(pool.instances))
+        MODEL_POOL_AVAILABLE.labels(model=pool.model_id).set(pool.available.qsize())
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # ───────── TTL caches (align / diarize) ─────────
 class TTLCache(dict):
@@ -548,68 +602,90 @@ def _sweep():
 threading.Thread(target=_sweep, daemon=True).start()
 
 # ───────── Pipeline ─────────
+def _transcribe_with_metrics(whisper, wav, transcribe_kw, model, audio_sec):
+    """Runs whisper.transcribe on the current executor thread and records
+    per-thread realtime-factor metrics. Executed inside EXECUTOR via
+    run_sync, so `threading.current_thread().name` identifies which of the
+    MAX_THREADS worker threads actually did the work."""
+    thread = threading.current_thread().name
+    t0 = time.perf_counter()
+    raw = whisper.transcribe(wav, **transcribe_kw)
+    elapsed = time.perf_counter() - t0
+    TRANSCRIBE_THREAD_SECONDS.labels(model=model, thread=thread).inc(elapsed)
+    if elapsed > 0:
+        TRANSCRIBE_SPEED_RATIO.labels(model=model, thread=thread).observe(audio_sec / elapsed)
+    AUDIO_SECONDS_TOTAL.labels(model=model).inc(audio_sec)
+    return raw
+
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_model_name: str | None):
     fname = Path(path).name
+    ACTIVE_TRANSCRIPTIONS.inc()
     try:
-        wav = await run_sync(whisperx.load_audio, path)
-    except Exception as e:
-        logging.error("Error loading audio file %s: %s", fname, e, exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
+        try:
+            wav = await run_sync(whisperx.load_audio, path)
+        except Exception as e:
+            ERRORS_TOTAL.labels(stage="load_audio").inc()
+            logging.error("Error loading audio file %s: %s", fname, e, exc_info=True)
+            raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
 
-    audio_sec = len(wav) / 16000
-    t0 = time.perf_counter()
+        audio_sec = len(wav) / 16000
+        t0 = time.perf_counter()
 
-    try:
-        # transcription
-        _log("transcribe_start", fname, "model=%s", model)
-        asr_config = ASR_CONFIG.get(model, {})
-        asr_options = ASROptions(
-            beam_size=asr_config.get("beam_size"),
-            patience=asr_config.get("patience"),
-            length_penalty=asr_config.get("length_penalty"),
-            best_of=asr_config.get("best_of"),
-        )
-        pool = get_whisper_pool(model, asr_options)
-        async with pool.acquire() as whisper:
-            transcribe_kw = dict(trans_kw)
-            if lang:
-                transcribe_kw["language"] = lang
-                _log("transcribe_opts", fname, "lang=%s", lang)
-            else:
-                _log("transcribe_opts", fname, "lang=auto")
-            raw = await run_sync(whisper.transcribe, wav, **transcribe_kw)
-        res = standardize(raw)
-        _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
+        try:
+            # transcription
+            _log("transcribe_start", fname, "model=%s", model)
+            asr_config = ASR_CONFIG.get(model, {})
+            asr_options = ASROptions(
+                beam_size=asr_config.get("beam_size"),
+                patience=asr_config.get("patience"),
+                length_penalty=asr_config.get("length_penalty"),
+                best_of=asr_config.get("best_of"),
+            )
+            pool = get_whisper_pool(model, asr_options)
+            async with pool.acquire() as whisper:
+                transcribe_kw = dict(trans_kw)
+                if lang:
+                    transcribe_kw["language"] = lang
+                    _log("transcribe_opts", fname, "lang=%s", lang)
+                else:
+                    _log("transcribe_opts", fname, "lang=auto")
+                raw = await run_sync(_transcribe_with_metrics, whisper, wav, transcribe_kw, model, audio_sec)
+            res = standardize(raw)
+            _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
 
-        # alignment
-        if do_align:
-            t = time.perf_counter(); lang_used = res.get("language") or lang
-            _log("align_start", fname, "lang=%s", lang_used)
-            model_a, meta = await load_align(lang_used)
-            res = standardize(await run_sync(
-                whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
-            _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+            # alignment
+            if do_align:
+                t = time.perf_counter(); lang_used = res.get("language") or lang
+                _log("align_start", fname, "lang=%s", lang_used)
+                model_a, meta = await load_align(lang_used)
+                res = standardize(await run_sync(
+                    whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
+                _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-        # diarisation
-        if do_diar:
-            t = time.perf_counter(); _log("diarize_start", fname)
-            diar_pipe = await load_diar(diar_model_name)
-            spk = await run_sync(diar_pipe, wav, **diar_kw)
-            res = standardize(await run_sync(
-                whisperx.assign_word_speakers, spk, res), spk=True)
-            _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+            # diarisation
+            if do_diar:
+                t = time.perf_counter(); _log("diarize_start", fname)
+                diar_pipe = await load_diar(diar_model_name)
+                spk = await run_sync(diar_pipe, wav, **diar_kw)
+                res = standardize(await run_sync(
+                    whisperx.assign_word_speakers, spk, res), spk=True)
+                _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error during processing: {e}")
+        except HTTPException:
+            ERRORS_TOTAL.labels(stage="processing").inc()
+            raise
+        except Exception as e:
+            ERRORS_TOTAL.labels(stage="processing").inc()
+            logging.error("Error during processing of %s: %s", fname, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Error during processing: {e}")
 
-    wall = time.perf_counter() - t0
-    logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
-                 fname, wall, audio_sec, audio_sec / wall if wall else 0)
-    res["duration"] = round(audio_sec, 2)
-    return res
+        wall = time.perf_counter() - t0
+        logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
+                     fname, wall, audio_sec, audio_sec / wall if wall else 0)
+        res["duration"] = round(audio_sec, 2)
+        return res
+    finally:
+        ACTIVE_TRANSCRIPTIONS.dec()
 
 # ───────── KW builders ─────────
 def build_transcribe_kwargs(batch, word_ts, vad, vad_thr):
@@ -682,6 +758,24 @@ def common_form_params(
     )
 
 # ───────── Endpoints ─────────
+@contextlib.asynccontextmanager
+async def _track_request(endpoint: str, response_format):
+    """Records whisperx_requests_total / whisperx_request_duration_seconds
+    for one HTTP request, regardless of which response_format was chosen."""
+    t0 = time.perf_counter()
+    status = "success"
+    try:
+        yield
+    except HTTPException as e:
+        status = f"error_{e.status_code}"
+        raise
+    except Exception:
+        status = "error_500"
+        raise
+    finally:
+        REQUEST_DURATION.labels(endpoint=endpoint).observe(time.perf_counter() - t0)
+        REQUESTS_TOTAL.labels(endpoint=endpoint, response_format=str(response_format), status=status).inc()
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(..., description="Binary audio (any FFmpeg-decodable format)."),
@@ -689,22 +783,23 @@ async def transcriptions(
     params: dict = Depends(common_form_params),
 ):
     """Transcribes an audio file."""
-    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
-        tmp.write(await file.read())
-        tmp.flush()
-        # Sanitize language: treat empty strings or 'auto'/'detect' as None
-        lang = (language or "").strip() or None
-        if lang and lang.lower() in ("auto", "detect", "autodetect"):
-            lang = None
-        res = await process(
-            tmp.name, params["model"], lang, params["align"], params["diarize"],
-            build_transcribe_kwargs(
-                params["batch_size"], params["word_timestamps"],
-                params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
-            params["diarization_model"],
-        )
-        return _fmt(res, params["response_format"])
+    async with _track_request("transcriptions", params["response_format"]):
+        with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+            tmp.write(await file.read())
+            tmp.flush()
+            # Sanitize language: treat empty strings or 'auto'/'detect' as None
+            lang = (language or "").strip() or None
+            if lang and lang.lower() in ("auto", "detect", "autodetect"):
+                lang = None
+            res = await process(
+                tmp.name, params["model"], lang, params["align"], params["diarize"],
+                build_transcribe_kwargs(
+                    params["batch_size"], params["word_timestamps"],
+                    params["vad_filter"], params["vad_threshold"]),
+                build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+                params["diarization_model"],
+            )
+            return _fmt(res, params["response_format"])
 
 @app.post("/v1/audio/translations")
 async def translations(
@@ -712,15 +807,17 @@ async def translations(
     params: dict = Depends(common_form_params),
 ):
     """Translates an audio file to English."""
-    with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
-        tmp.write(await file.read())
-        tmp.flush()
-        res = await process(
-            tmp.name, params["model"], None, params["align"], params["diarize"],
-            build_transcribe_kwargs(
-                params["batch_size"], params["word_timestamps"],
-                params["vad_filter"], params["vad_threshold"]),
-            build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
-            params["diarization_model"],
-        )
-        return _fmt(res, params["response_format"])
+    async with _track_request("translations", params["response_format"]):
+        with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+            tmp.write(await file.read())
+            tmp.flush()
+            res = await process(
+                tmp.name, params["model"], None, params["align"], params["diarize"],
+                build_transcribe_kwargs(
+                    params["batch_size"], params["word_timestamps"],
+                    params["vad_filter"], params["vad_threshold"]),
+                build_diar_kwargs(params["min_speakers"], params["max_speakers"]),
+                params["diarization_model"],
+            )
+            return _fmt(res, params["response_format"])
+

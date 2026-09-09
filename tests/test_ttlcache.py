@@ -36,6 +36,7 @@ fastapi_stub.HTTPException = Exception
 responses_stub = types.ModuleType("fastapi.responses")
 responses_stub.JSONResponse = object
 responses_stub.PlainTextResponse = object
+responses_stub.Response = object
 fastapi_stub.responses = responses_stub
 sys.modules['fastapi'] = fastapi_stub
 sys.modules['fastapi.responses'] = responses_stub

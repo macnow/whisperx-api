@@ -136,6 +136,22 @@ volumes:
 
 ---
 
+## Metrics
+
+`GET /metrics` exposes Prometheus metrics, including:
+
+* `whisperx_requests_total`, `whisperx_request_duration_seconds` — per-endpoint request counts/latency.
+* `whisperx_transcribe_speed_ratio` — realtime factor (`audio_seconds / wall_seconds`) of the
+  `whisper.transcribe` call, labeled by `model` and by the **executor thread** that ran it. Use
+  this to see whether raising `TRANSCRIBE_CONCURRENCY` / `MAX_THREADS` is actually improving
+  per-thread throughput on your GPU, rather than just overall request latency.
+* `whisperx_transcribe_thread_seconds_total`, `whisperx_audio_seconds_total` — cumulative time/audio processed.
+* `whisperx_active_transcriptions`, `whisperx_model_pool_instances`, `whisperx_model_pool_available` — in-flight requests and current whisper pool sizes.
+* `whisperx_gpu_free_memory_mb` — free CUDA memory as of the last scrape.
+* `whisperx_errors_total{stage}` — errors during audio loading vs. transcription/align/diarize.
+
+---
+
 ## Endpoints
 
 ### `POST /v1/audio/transcriptions`
