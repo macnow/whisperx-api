@@ -164,6 +164,9 @@ volumes:
 * `whisperx_gpu_free_memory_mb` — free CUDA memory as of the last scrape.
 * `whisperx_errors_total{stage}` — errors during audio loading vs. transcription/align/diarize.
 
+A ready-to-import Grafana dashboard covering all of these metrics is available in
+[`grafana/whisperx-dashboard.json`](grafana/whisperx-dashboard.json) (see `grafana/README.md` for import steps).
+
 ---
 
 ## Endpoints
