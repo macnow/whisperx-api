@@ -100,9 +100,20 @@ Docker image built from `Dockerfile`.
   `whisperx_pool_wait_seconds` for the time spent waiting for an instance
   (ensure_loaded + queue wait combined — the real "did this request have to
   queue" latency). `process()` also observes `whisperx_audio_duration_seconds`,
-  `whisperx_num_speakers_detected`, and increments
-  `whisperx_language_detected_total`; the endpoints observe
-  `whisperx_upload_size_bytes` right after reading the uploaded file.
+  `whisperx_num_speakers_detected`, `whisperx_align_word_coverage_ratio`
+  (fraction of words with a word-level timestamp after alignment),
+  `whisperx_unassigned_speaker_ratio` (fraction of segments diarization
+  couldn't assign a speaker to), `whisperx_segments_count`/`whisperx_words_count`,
+  and increments `whisperx_language_detected_total`; the endpoints observe
+  `whisperx_upload_size_bytes`/`whisperx_upload_seconds` right after reading
+  the uploaded file, and `_fmt()` observes `whisperx_response_size_bytes`
+  per `response_format` just before returning the response. GPU/process
+  utilization gauges (`whisperx_gpu_utilization_percent`, `..._temperature_celsius`,
+  `..._power_watts` via NVML/`nvidia-ml-py`; `whisperx_process_cpu_percent`,
+  `whisperx_process_rss_mb` via `psutil`) are soft dependencies — guarded at
+  import time (`_NVML_HANDLE`/`_PROCESS` become `None` if unavailable) and
+  refreshed in `_update_gpu_stats()`/`_update_process_stats()`, called from
+  the `/metrics` handler on every scrape (not per-request).
 
 ## Conventions
 

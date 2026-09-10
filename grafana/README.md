@@ -44,4 +44,8 @@ scrape_configs:
   load/eviction rate per kind (whisper/align/diarize), pool wait time (p95)
   by model, median audio duration/upload size, median speakers detected,
   and request rate by detected language.
+- **Response shape, quality & system resources** — client upload time (p95),
+  median response size by format, alignment word-coverage and diarization
+  speaker-assignment rates, GPU SM utilization %, API process CPU %, and GPU
+  thermals/power & process RSS memory over time.
 

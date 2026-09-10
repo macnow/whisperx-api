@@ -1,5 +1,5 @@
 """
-WhisperX Transcription API · v1.13.0
+WhisperX Transcription API · v1.14.0
 (OpenAI-compatible)
 
 •  GPU-only WhisperX wrapper with optional alignment & diarisation
@@ -32,6 +32,21 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 from urllib.parse import quote_plus
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
+# Optional system/GPU-utilization metrics deps. Both are soft dependencies:
+# if not installed (or no NVML support, e.g. no NVIDIA driver), the related
+# gauges just stay unset rather than crashing the app.
+try:
+    import psutil
+except ImportError:
+    psutil = None
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+except Exception:
+    pynvml = None
+    _NVML_HANDLE = None
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)8s  %(message)s")
 
@@ -43,6 +58,7 @@ DEVICE, COMPUTE_TYPE, BATCH_SIZE = "cuda", "float16", 16
 MAX_THREADS = int(os.getenv("MAX_THREADS", "4"))
 EXECUTOR   = ThreadPoolExecutor(max_workers=MAX_THREADS)
 FW_THREADS = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ not forwarded
+_PROCESS = psutil.Process() if psutil else None
 
 _MB = 1024 * 1024
 def free_mb() -> int:
@@ -172,7 +188,7 @@ DEFAULT_ASR_CONFIG = {
 ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
 ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
-app = FastAPI(title="WhisperX Transcription API", version="1.13.0")
+app = FastAPI(title="WhisperX Transcription API", version="1.14.0")
 
 @app.on_event("startup")
 async def on_startup():
@@ -308,9 +324,79 @@ POOL_WAIT_SECONDS = Histogram(
     ["model"],
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60))
 
+# Upload/response shape: where does wall time actually go (client upload vs.
+# processing), and how big are responses per format.
+UPLOAD_SECONDS = Histogram(
+    "whisperx_upload_seconds",
+    "Wall time spent reading the uploaded file from the client request.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120))
+RESPONSE_SIZE_BYTES = Histogram(
+    "whisperx_response_size_bytes",
+    "Size of the formatted response body, per response_format.",
+    ["response_format"],
+    buckets=(1e2, 1e3, 1e4, 1e5, 5e5, 1e6, 5e6, 1e7))
+SEGMENTS_COUNT = Histogram(
+    "whisperx_segments_count",
+    "Number of segments in the final transcription result, per request.",
+    buckets=(1, 5, 10, 25, 50, 100, 250, 500, 1000))
+WORDS_COUNT = Histogram(
+    "whisperx_words_count",
+    "Number of words in the final transcription result, per request.",
+    buckets=(10, 50, 100, 250, 500, 1000, 2500, 5000, 10000))
+
+# Alignment / diarization quality signals.
+ALIGN_WORD_COVERAGE_RATIO = Histogram(
+    "whisperx_align_word_coverage_ratio",
+    "Fraction of words that received a word-level timestamp from alignment "
+    "(1.0 = fully aligned), per request.",
+    buckets=(0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0))
+UNASSIGNED_SPEAKER_RATIO = Histogram(
+    "whisperx_unassigned_speaker_ratio",
+    "Fraction of segments that diarization could not assign a speaker to, "
+    "per request (0.0 = every segment got a speaker).",
+    buckets=(0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0))
+
+# GPU utilization/thermals (via NVML) and process CPU/RAM (via psutil).
+# Both are best-effort: gauges simply stay unset if the optional dependency
+# or NVML support is unavailable (see _NVML_HANDLE/_PROCESS above).
+GPU_UTILIZATION_PERCENT = Gauge(
+    "whisperx_gpu_utilization_percent", "GPU SM utilization % (last scrape).")
+GPU_TEMPERATURE_CELSIUS = Gauge(
+    "whisperx_gpu_temperature_celsius", "GPU temperature in Celsius (last scrape).")
+GPU_POWER_WATTS = Gauge(
+    "whisperx_gpu_power_watts", "GPU power draw in watts (last scrape).")
+PROCESS_CPU_PERCENT = Gauge(
+    "whisperx_process_cpu_percent", "API process CPU utilization % (last scrape).")
+PROCESS_RSS_MB = Gauge(
+    "whisperx_process_rss_mb", "API process resident memory (RSS) in MB (last scrape).")
+
+def _update_gpu_stats():
+    if _NVML_HANDLE is None:
+        return
+    try:
+        util = pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE)
+        GPU_UTILIZATION_PERCENT.set(util.gpu)
+        temp = pynvml.nvmlDeviceGetTemperature(_NVML_HANDLE, pynvml.NVML_TEMPERATURE_GPU)
+        GPU_TEMPERATURE_CELSIUS.set(temp)
+        power_mw = pynvml.nvmlDeviceGetPowerUsage(_NVML_HANDLE)
+        GPU_POWER_WATTS.set(power_mw / 1000)
+    except Exception:
+        logging.debug("NVML stats unavailable this scrape", exc_info=True)
+
+def _update_process_stats():
+    if _PROCESS is None:
+        return
+    try:
+        PROCESS_CPU_PERCENT.set(_PROCESS.cpu_percent(interval=None))
+        PROCESS_RSS_MB.set(_PROCESS.memory_info().rss / _MB)
+    except Exception:
+        logging.debug("psutil stats unavailable this scrape", exc_info=True)
+
 @app.get("/metrics")
 def metrics():
     GPU_FREE_MEMORY_MB.set(free_mb())
+    _update_gpu_stats()
+    _update_process_stats()
     with _POOLS_LOCK:
         pools = list(WHISPER_POOLS.values())
     for pool in pools:
@@ -784,6 +870,14 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
                     whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
                 align_elapsed = time.perf_counter() - t
                 _record_stage("align", model, align_elapsed)
+                total_words = aligned_words = 0
+                for s in res["segments"]:
+                    for w in s.get("words") or []:
+                        total_words += 1
+                        if w.get("start") is not None:
+                            aligned_words += 1
+                if total_words:
+                    ALIGN_WORD_COVERAGE_RATIO.observe(aligned_words / total_words)
                 _log("align_end", fname, "Δ=%.2fs", align_elapsed)
 
             # diarisation
@@ -798,6 +892,10 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
                 num_speakers = len({s["speaker"] for s in res["segments"] if s.get("speaker")})
                 if num_speakers:
                     NUM_SPEAKERS_DETECTED.observe(num_speakers)
+                segs = res["segments"]
+                if segs:
+                    unassigned = sum(1 for s in segs if not s.get("speaker"))
+                    UNASSIGNED_SPEAKER_RATIO.observe(unassigned / len(segs))
                 _log("diarize_end", fname, "Δ=%.2fs", diarize_elapsed)
 
         except HTTPException:
@@ -811,6 +909,8 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
         wall = time.perf_counter() - t0
         logging.info("[summary] %s Δ=%.2fs audio=%.2fs speed=%.1fx",
                      fname, wall, audio_sec, audio_sec / wall if wall else 0)
+        SEGMENTS_COUNT.observe(len(res["segments"]))
+        WORDS_COUNT.observe(sum(len(s["text"].split()) for s in res["segments"]))
         res["duration"] = round(audio_sec, 2)
         return res
     finally:
@@ -850,15 +950,18 @@ def _fmt(res, fmt):
         fmt = fmt.value
     text, seg = res["text"], res["segments"]
     if fmt == "text":
-        return PlainTextResponse(text)
-    if fmt == "srt":
-        return PlainTextResponse(srt_from(seg), media_type="text/srt")
-    if fmt == "vtt":
-        return PlainTextResponse(vtt_from(seg), media_type="text/vtt")
-    if fmt == "verbose_json":
+        resp = PlainTextResponse(text)
+    elif fmt == "srt":
+        resp = PlainTextResponse(srt_from(seg), media_type="text/srt")
+    elif fmt == "vtt":
+        resp = PlainTextResponse(vtt_from(seg), media_type="text/vtt")
+    elif fmt == "verbose_json":
         # OpenAI verbose_json includes top-level `duration`; we add `usage` too.
-        return JSONResponse({**res, "usage": _usage(res)})
-    return JSONResponse({"text": text, "usage": _usage(res)})
+        resp = JSONResponse({**res, "usage": _usage(res)})
+    else:
+        resp = JSONResponse({"text": text, "usage": _usage(res)})
+    RESPONSE_SIZE_BYTES.labels(response_format=fmt).observe(len(resp.body))
+    return resp
 
 # ───────── Dependencies ─────────
 def common_form_params(
@@ -915,7 +1018,9 @@ async def transcriptions(
     """Transcribes an audio file."""
     async with _track_request("transcriptions", params["response_format"], params["model"]):
         with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+            _t_upload0 = time.perf_counter()
             data = await file.read()
+            UPLOAD_SECONDS.observe(time.perf_counter() - _t_upload0)
             UPLOAD_SIZE_BYTES.observe(len(data))
             tmp.write(data)
             tmp.flush()
@@ -941,7 +1046,9 @@ async def translations(
     """Translates an audio file to English."""
     async with _track_request("translations", params["response_format"], params["model"]):
         with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+            _t_upload0 = time.perf_counter()
             data = await file.read()
+            UPLOAD_SECONDS.observe(time.perf_counter() - _t_upload0)
             UPLOAD_SIZE_BYTES.observe(len(data))
             tmp.write(data)
             tmp.flush()

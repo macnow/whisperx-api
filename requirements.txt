@@ -16,3 +16,8 @@ huggingface-hub
 
 # Prometheus metrics
 prometheus-client
+
+# Optional GPU/process utilization metrics (soft dependencies; app degrades
+# gracefully if unavailable)
+nvidia-ml-py
+psutil

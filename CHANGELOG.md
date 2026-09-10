@@ -4,6 +4,30 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.14.0] – 2026-09-10
+### Added
+- Response/segment shape metrics:
+  - `whisperx_response_size_bytes{response_format}` – size of the formatted
+    response body.
+  - `whisperx_segments_count`, `whisperx_words_count` – size of the final
+    transcription result per request.
+  - `whisperx_upload_seconds` – wall time spent reading the uploaded file
+    (separates client-upload time from processing time in overall latency).
+- Alignment/diarization quality metrics:
+  - `whisperx_align_word_coverage_ratio` – fraction of words that received a
+    word-level timestamp from alignment.
+  - `whisperx_unassigned_speaker_ratio` – fraction of segments diarization
+    could not assign a speaker to.
+- GPU/process utilization metrics (soft dependencies, degrade gracefully if
+  unavailable):
+  - `whisperx_gpu_utilization_percent`, `whisperx_gpu_temperature_celsius`,
+    `whisperx_gpu_power_watts` via NVML (`nvidia-ml-py`).
+  - `whisperx_process_cpu_percent`, `whisperx_process_rss_mb` via `psutil`.
+- New optional dependencies `nvidia-ml-py` and `psutil` added to
+  `requirements.txt` and the Dockerfile wheel-builder stage.
+
+---
+
 ## [1.13.0] – 2026-09-10
 ### Added
 - Capacity, cost & stage-breakdown metrics:

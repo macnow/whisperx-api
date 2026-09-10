@@ -1,9 +1,23 @@
-# WhisperX Transcription API · v1.13.0
+# WhisperX Transcription API · v1.14.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.14.0  (2026-09-10)
+
+* **Even more Prometheus metrics**: response size per `response_format`
+  (`whisperx_response_size_bytes`), segment/word counts
+  (`whisperx_segments_count`, `whisperx_words_count`), client upload time
+  (`whisperx_upload_seconds`), alignment word-coverage ratio
+  (`whisperx_align_word_coverage_ratio`), unassigned-speaker ratio from
+  diarization (`whisperx_unassigned_speaker_ratio`), and GPU/process
+  utilization gauges (`whisperx_gpu_utilization_percent`,
+  `whisperx_gpu_temperature_celsius`, `whisperx_gpu_power_watts` via NVML;
+  `whisperx_process_cpu_percent`, `whisperx_process_rss_mb` via psutil — all
+  soft dependencies that degrade gracefully if unavailable). See "Metrics"
+  below.
 
 ## What’s new in 1.13.0  (2026-09-10)
 
@@ -204,6 +218,21 @@ volumes:
   transcription language.
 * `whisperx_requests_total` now also carries a `model` label, so you can break down request
   volume/errors per Faster-Whisper model.
+* `whisperx_upload_seconds`, `whisperx_response_size_bytes{response_format}` — client upload
+  time vs. the size of the formatted response, so you can see whether request latency is
+  dominated by upload, processing, or response encoding.
+* `whisperx_segments_count`, `whisperx_words_count` — size of the final transcription result,
+  per request.
+* `whisperx_align_word_coverage_ratio` — fraction of words that received a word-level timestamp
+  from alignment (1.0 = fully aligned); low values indicate poor alignment quality for that
+  audio/language.
+* `whisperx_unassigned_speaker_ratio` — fraction of segments diarization could not assign a
+  speaker to (0.0 = every segment got one); a diarization-quality signal.
+* `whisperx_gpu_utilization_percent`, `whisperx_gpu_temperature_celsius`, `whisperx_gpu_power_watts`
+  — GPU SM utilization/thermals/power via NVML (requires the `nvidia-ml-py` package and an NVML-
+  capable driver; gauges simply stay at their default if unavailable).
+* `whisperx_process_cpu_percent`, `whisperx_process_rss_mb` — API process CPU/RAM usage via
+  `psutil` (also a soft dependency).
 
 A ready-to-import Grafana dashboard covering all of these metrics is available in
 [`grafana/whisperx-dashboard.json`](grafana/whisperx-dashboard.json) (see `grafana/README.md` for import steps).
