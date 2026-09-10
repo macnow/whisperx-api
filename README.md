@@ -1,9 +1,19 @@
-# WhisperX Transcription API · v1.12.1
+# WhisperX Transcription API · v1.13.0
 
 Open-source, **OpenAI-compatible** HTTP service built on top of [WhisperX](https://github.com/m-bain/whisperX) with optional alignment & diarisation.
 Runs GPU-only, supports every Faster-Whisper variant, and can operate fully offline.
 
 ---
+
+## What’s new in 1.13.0  (2026-09-10)
+
+* **More Prometheus metrics** for cold-start visibility, capacity planning, and audio/request
+  shape: `whisperx_model_load_seconds{kind}`, `whisperx_model_load_events_total{kind}`,
+  `whisperx_model_vram_usage_mb{kind,key}`, `whisperx_model_evictions_total{kind}`,
+  `whisperx_pool_wait_seconds{model}`, `whisperx_audio_duration_seconds`,
+  `whisperx_upload_size_bytes`, `whisperx_num_speakers_detected`,
+  `whisperx_language_detected_total{language}`, and a `model` label added to
+  `whisperx_requests_total`. See "Metrics" below.
 
 ## What’s new in 1.12.1  (2026-09-09)
 
@@ -136,6 +146,7 @@ volumes:
 | `MODEL_TTL_SEC`             | `600`      | Seconds of inactivity after which a model is evicted from VRAM.                              |
 | `MAX_THREADS`               | `4`        | Size of the ThreadPoolExecutor for blocking work.                                            |
 | `TRANSCRIBE_CONCURRENCY`    | `1`        | Number of warm Whisper instances per `(model, asr_options)` pool. Increase on big GPUs (L40s: 3-5 for large-v3). |
+| `GPU_HOURLY_COST_USD`       | `0`        | Hourly GPU rate used to compute `whisperx_estimated_cost_usd_total` (0 = cost tracking disabled). |
 | `FASTER_WHISPER_THREADS`    | `0`        | Value forwarded to Faster-Whisper `threads` (0 = not passed).                                |
 | `HF_TOKEN`                  | —          | HF access token for private diarization models.                                              |
 | `LOCAL_ONLY_MODELS`         | `0`        | `1` → forbid downloads, fail if model not cached.                                            |
@@ -159,10 +170,40 @@ volumes:
   `whisper.transcribe` call, labeled by `model` and by the **executor thread** that ran it. Use
   this to see whether raising `TRANSCRIBE_CONCURRENCY` / `MAX_THREADS` is actually improving
   per-thread throughput on your GPU, rather than just overall request latency.
-* `whisperx_transcribe_thread_seconds_total`, `whisperx_audio_seconds_total` — cumulative time/audio processed.
-* `whisperx_active_transcriptions`, `whisperx_model_pool_instances`, `whisperx_model_pool_available` — in-flight requests and current whisper pool sizes.
+* `whisperx_transcribe_thread_seconds_total`, `whisperx_audio_seconds_total` — cumulative time/audio
+  processed per model. Wrap in `increase(whisperx_audio_seconds_total[$range])/60` for "minutes of
+  audio processed in a period".
+* `whisperx_process_stage_seconds{stage,model}` — per-request wall time of each pipeline stage
+  (`transcribe`/`align`/`diarize`), so you can see each stage's **% share** of total processing
+  time (e.g. `sum(rate(whisperx_process_stage_seconds_sum[5m])) by (stage)`).
+* `whisperx_estimated_cost_usd_total{stage}` — estimated GPU cost, computed as
+  `stage_wall_seconds * GPU_HOURLY_COST_USD / 3600` (set the `GPU_HOURLY_COST_USD` env var to your
+  hourly GPU rate; defaults to `0`, i.e. disabled). Divide by processed audio-minutes for a
+  $/audio-minute figure comparable to hosted transcription APIs.
+* `whisperx_active_transcriptions`, `whisperx_model_pool_instances`, `whisperx_model_pool_available`,
+  `whisperx_model_pool_target_size` — in-flight requests, current vs. idle vs. configured-max whisper
+  pool sizes (`% capacity used = (instances-available)/target_size`).
+* `whisperx_executor_active_tasks` / `whisperx_executor_max_workers` — saturation of the shared
+  thread pool that backs **all** blocking work (model loads, audio decode, transcribe, align,
+  diarize), i.e. the real throughput ceiling, not just the whisper pools.
 * `whisperx_gpu_free_memory_mb` — free CUDA memory as of the last scrape.
 * `whisperx_errors_total{stage}` — errors during audio loading vs. transcription/align/diarize.
+* `whisperx_model_load_seconds{kind}`, `whisperx_model_load_events_total{kind}` — cold-start
+  latency and frequency for `whisper`/`align`/`diarize` model loads (not counted when reused
+  from a warm pool/cache).
+* `whisperx_model_vram_usage_mb{kind,key}` — VRAM delta of the most recent load of each
+  model/language/diarization-model key.
+* `whisperx_model_evictions_total{kind}` — TTL-based unload events per model kind.
+* `whisperx_pool_wait_seconds{model}` — time a request spent waiting to acquire a whisper
+  instance from its pool (includes cold-load time when applicable) — the real "did I have to
+  queue" latency, distinct from `whisperx_executor_active_tasks`.
+* `whisperx_audio_duration_seconds`, `whisperx_upload_size_bytes` — distribution of input audio
+  length and uploaded file size, useful for sizing `batch_size`/timeouts.
+* `whisperx_num_speakers_detected` — distribution of distinct speakers found by diarisation.
+* `whisperx_language_detected_total{language}` — count of requests by (autodetected or forced)
+  transcription language.
+* `whisperx_requests_total` now also carries a `model` label, so you can break down request
+  volume/errors per Faster-Whisper model.
 
 A ready-to-import Grafana dashboard covering all of these metrics is available in
 [`grafana/whisperx-dashboard.json`](grafana/whisperx-dashboard.json) (see `grafana/README.md` for import steps).

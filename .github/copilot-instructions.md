@@ -81,6 +81,28 @@ Docker image built from `Dockerfile`.
   did the transcription — this is intentional per-thread throughput
   visibility, not per-request latency. Keep new metrics consistent with this
   pattern (record where the work happens, not from a wrapper afterward).
+  `_record_stage(stage, model, elapsed)` is the single place that records
+  both `whisperx_process_stage_seconds` (transcribe/align/diarize share) and
+  `whisperx_estimated_cost_usd_total` (elapsed × `GPU_HOURLY_COST_USD`/3600,
+  a no-op when that env var is `0`) — call it from `process()` rather than
+  duplicating the cost math elsewhere. `run_sync()` increments/decrements
+  `EXECUTOR_ACTIVE_TASKS` around every blocking call (model loads, audio
+  decode, transcribe, align, diarize all share one `ThreadPoolExecutor`), so
+  `whisperx_executor_active_tasks / whisperx_executor_max_workers` reflects
+  *overall* saturation, not just transcription. `_load_start()`/`_load_end()`
+  (used by `WhisperPool.ensure_loaded()`, `load_align()`, `load_diar()`) also
+  record `whisperx_model_load_seconds`/`whisperx_model_load_events_total`
+  (cold-start duration/count) and `whisperx_model_vram_usage_mb` per kind —
+  `_load_start()` returns a `time.perf_counter()` start value that must be
+  threaded through to the matching `_load_end()` call. `TTLCache.sweep()` and
+  the whisper-pool idle sweeper (`_sweep_pools()`) both increment
+  `whisperx_model_evictions_total{kind}`. `WhisperPool.acquire()` records
+  `whisperx_pool_wait_seconds` for the time spent waiting for an instance
+  (ensure_loaded + queue wait combined — the real "did this request have to
+  queue" latency). `process()` also observes `whisperx_audio_duration_seconds`,
+  `whisperx_num_speakers_detected`, and increments
+  `whisperx_language_detected_total`; the endpoints observe
+  `whisperx_upload_size_bytes` right after reading the uploaded file.
 
 ## Conventions
 

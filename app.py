@@ -1,5 +1,5 @@
 """
-WhisperX Transcription API · v1.12.1
+WhisperX Transcription API · v1.13.0
 (OpenAI-compatible)
 
 •  GPU-only WhisperX wrapper with optional alignment & diarisation
@@ -40,7 +40,8 @@ torch.backends.cudnn.allow_tf32 = False
 assert torch.cuda.is_available(), "CUDA GPU required"
 
 DEVICE, COMPUTE_TYPE, BATCH_SIZE = "cuda", "float16", 16
-EXECUTOR   = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_THREADS", "4")))
+MAX_THREADS = int(os.getenv("MAX_THREADS", "4"))
+EXECUTOR   = ThreadPoolExecutor(max_workers=MAX_THREADS)
 FW_THREADS = int(os.getenv("FASTER_WHISPER_THREADS", "0"))  # 0 ⇒ not forwarded
 
 _MB = 1024 * 1024
@@ -48,8 +49,16 @@ def free_mb() -> int:
     return torch.cuda.mem_get_info()[0] // _MB
 
 async def run_sync(func, *a, **kw):
+    """Offload a blocking call to EXECUTOR. `EXECUTOR_ACTIVE_TASKS` counts
+    calls that are scheduled-or-running here, so `.../whisperx_executor_max_workers`
+    gives a rough executor-saturation ratio across ALL blocking work (model
+    loads, audio decode, transcribe, align, diarize) - not just transcription."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(EXECUTOR, lambda: func(*a, **kw))
+    EXECUTOR_ACTIVE_TASKS.inc()
+    try:
+        return await loop.run_in_executor(EXECUTOR, lambda: func(*a, **kw))
+    finally:
+        EXECUTOR_ACTIVE_TASKS.dec()
 
 # ───────── Faster-Whisper catalogue ─────────
 _MODELS = {
@@ -138,6 +147,10 @@ TTL_SEC  = int(os.getenv("MODEL_TTL_SEC", "600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "").strip() or None
 TRANSCRIBE_CONCURRENCY = max(1, int(os.getenv("TRANSCRIBE_CONCURRENCY", "1")))
+# Optional: used only to turn GPU-busy-seconds into an estimated USD cost
+# metric (whisperx_estimated_cost_usd_total). 0 (default) means "unknown/
+# disabled" - the counter still exists but never accrues anything.
+GPU_HOURLY_COST_USD = float(os.getenv("GPU_HOURLY_COST_USD", "0") or 0)
 
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -159,7 +172,7 @@ DEFAULT_ASR_CONFIG = {
 ASR_CONFIG_JSON = os.getenv("ASR_CONFIG_JSON")
 ASR_CONFIG = json.loads(ASR_CONFIG_JSON) if ASR_CONFIG_JSON else DEFAULT_ASR_CONFIG
 
-app = FastAPI(title="WhisperX Transcription API", version="1.12.1")
+app = FastAPI(title="WhisperX Transcription API", version="1.13.0")
 
 @app.on_event("startup")
 async def on_startup():
@@ -169,7 +182,7 @@ async def on_startup():
 # Request-level metrics
 REQUESTS_TOTAL = Counter(
     "whisperx_requests_total", "Total HTTP requests processed.",
-    ["endpoint", "response_format", "status"])
+    ["endpoint", "response_format", "status", "model"])
 REQUEST_DURATION = Histogram(
     "whisperx_request_duration_seconds", "End-to-end request wall time.",
     ["endpoint"])
@@ -198,6 +211,36 @@ AUDIO_SECONDS_TOTAL = Counter(
     "whisperx_audio_seconds_total", "Cumulative audio seconds transcribed.",
     ["model"])
 
+# Per-stage breakdown (transcribe / align / diarize), so you can see each
+# step's share of total processing time for a given request mix.
+PROCESS_STAGE_SECONDS = Histogram(
+    "whisperx_process_stage_seconds",
+    "Wall time spent in each processing stage per request.",
+    ["stage", "model"])
+
+# Estimated GPU cost: purely derived from wall-clock seconds spent in each
+# stage times GPU_HOURLY_COST_USD (0 = disabled, counter just stays at 0).
+# Divide by whisperx_audio_seconds_total (in minutes) for a $/audio-minute
+# figure, comparable to hosted-API pricing.
+GPU_HOURLY_COST_CONFIGURED = Gauge(
+    "whisperx_gpu_hourly_cost_usd",
+    "Configured GPU_HOURLY_COST_USD env var (0 = cost tracking disabled).")
+GPU_HOURLY_COST_CONFIGURED.set(GPU_HOURLY_COST_USD)
+ESTIMATED_COST_USD_TOTAL = Counter(
+    "whisperx_estimated_cost_usd_total",
+    "Estimated GPU cost accrued (stage_wall_seconds * GPU_HOURLY_COST_USD / 3600).",
+    ["stage"])
+
+# Executor saturation: ALL blocking work (model loads, audio decode,
+# transcribe, align, diarize) shares this single ThreadPoolExecutor, so its
+# utilization is the real ceiling on throughput - not just the whisper pools.
+EXECUTOR_ACTIVE_TASKS = Gauge(
+    "whisperx_executor_active_tasks",
+    "Blocking calls currently scheduled on or running in the shared executor.")
+EXECUTOR_MAX_WORKERS = Gauge(
+    "whisperx_executor_max_workers", "Configured MAX_THREADS (executor size).")
+EXECUTOR_MAX_WORKERS.set(MAX_THREADS)
+
 # Resource / pool gauges
 GPU_FREE_MEMORY_MB = Gauge(
     "whisperx_gpu_free_memory_mb", "Free CUDA memory as last observed.")
@@ -207,6 +250,63 @@ MODEL_POOL_SIZE = Gauge(
 MODEL_POOL_AVAILABLE = Gauge(
     "whisperx_model_pool_available", "Idle (unused) whisper instances per model pool.",
     ["model"])
+MODEL_POOL_TARGET_SIZE = Gauge(
+    "whisperx_model_pool_target_size",
+    "Configured target size (TRANSCRIBE_CONCURRENCY) for this model pool, "
+    "i.e. its max capacity once fully warmed up.",
+    ["model"])
+
+# Request/audio shape distributions - helps size batch_size/timeouts and spot
+# outlier uploads.
+AUDIO_DURATION_SECONDS = Histogram(
+    "whisperx_audio_duration_seconds",
+    "Distribution of input audio duration per request.",
+    buckets=(5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200))
+UPLOAD_SIZE_BYTES = Histogram(
+    "whisperx_upload_size_bytes",
+    "Distribution of uploaded file size per request.",
+    buckets=(1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9))
+
+# Diarization / language quality signals.
+NUM_SPEAKERS_DETECTED = Histogram(
+    "whisperx_num_speakers_detected",
+    "Number of distinct speakers found by diarization, per request.",
+    buckets=(1, 2, 3, 4, 5, 6, 8, 10, 15, 20))
+LANGUAGE_DETECTED_TOTAL = Counter(
+    "whisperx_language_detected_total",
+    "Count of requests by the language used for transcription "
+    "(autodetected or forced).",
+    ["language"])
+
+# Cold-start visibility: how long model loads take, per model-kind, and how
+# often a request actually has to pay that cost vs. reusing an already-warm
+# instance.
+MODEL_LOAD_SECONDS = Histogram(
+    "whisperx_model_load_seconds",
+    "Wall time spent loading a model (whisper/align/diarize) into memory.",
+    ["kind"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300))
+MODEL_LOAD_EVENTS_TOTAL = Counter(
+    "whisperx_model_load_events_total",
+    "Count of actual model (re)load events, i.e. cold starts, per kind.",
+    ["kind"])
+MODEL_VRAM_USAGE_MB = Gauge(
+    "whisperx_model_vram_usage_mb",
+    "VRAM delta (MB) consumed by the most recent load of this model/kind.",
+    ["kind", "key"])
+MODEL_EVICTIONS_TOTAL = Counter(
+    "whisperx_model_evictions_total",
+    "Count of model unload/eviction events after TTL idle timeout, per kind.",
+    ["kind"])
+
+# Pool queueing: time a request spends waiting to acquire a whisper instance
+# from its pool (includes any cold-load time plus real queueing backlog when
+# the pool is saturated). This is the actual "did I have to wait" latency.
+POOL_WAIT_SECONDS = Histogram(
+    "whisperx_pool_wait_seconds",
+    "Wall time spent waiting to acquire a whisper instance from its pool.",
+    ["model"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60))
 
 @app.get("/metrics")
 def metrics():
@@ -216,6 +316,7 @@ def metrics():
     for pool in pools:
         MODEL_POOL_SIZE.labels(model=pool.model_id).set(len(pool.instances))
         MODEL_POOL_AVAILABLE.labels(model=pool.model_id).set(pool.available.qsize())
+        MODEL_POOL_TARGET_SIZE.labels(model=pool.model_id).set(pool.size)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # ───────── TTL caches (align / diarize) ─────────
@@ -235,6 +336,7 @@ class TTLCache(dict):
             if now - ts > ttl:
                 del self[k]; torch.cuda.empty_cache()
                 key = {"align": "lang", "diarize": "model"}[self.label]
+                MODEL_EVICTIONS_TOTAL.labels(kind=self.label).inc()
                 logging.info("[%s_model_unload]  %s=%s  freeVRAM=%d MB",
                              self.label, key, k, free_mb())
 
@@ -292,16 +394,18 @@ class WhisperPool:
             while len(self.instances) < self.size:
                 idx = len(self.instances) + 1
                 log_key = f"{self.model_id} #{idx}/{self.size} asr_opts={self.asr_options}"
-                before = free_mb(); _load_start("whisper", log_key)
+                before = free_mb(); t0 = _load_start("whisper", log_key)
                 model = await run_sync(self._load_one)
                 self.instances.append(model)
                 await self.available.put(model)
-                _load_end("whisper", log_key, before)
+                _load_end("whisper", log_key, before, t0)
 
     @contextlib.asynccontextmanager
     async def acquire(self):
+        wait_t0 = time.perf_counter()
         await self.ensure_loaded()
         model = await self.available.get()
+        POOL_WAIT_SECONDS.labels(model=self.model_id).observe(time.perf_counter() - wait_t0)
         self.last_used = time.time()
         try:
             yield model
@@ -342,15 +446,20 @@ def _log(tag: str, fname: str, msg: str = "", *a):
     logging.info("[%s] %s  freeVRAM=%d MB " + msg,
                  tag, Path(fname).name, free_mb(), *a)
 
-def _load_start(lbl: str, key: str):
+def _load_start(lbl: str, key: str) -> float:
     logging.info("[%s_model_load_start]  %s=%s  freeVRAM=%d MB",
                  lbl, "model" if lbl in ("whisper", "diarize") else "lang", key, free_mb())
+    MODEL_LOAD_EVENTS_TOTAL.labels(kind=lbl).inc()
+    return time.perf_counter()
 
-def _load_end(lbl: str, key: str, before: int):
+def _load_end(lbl: str, key: str, before: int, start: float | None = None):
     delta = before - free_mb()
     logging.info("[%s_model_load_end]    %s=%s  used=%+d MB  freeVRAM=%d MB",
                  lbl, "model" if lbl in ("whisper", "diarize") else "lang",
                  key, delta, free_mb())
+    MODEL_VRAM_USAGE_MB.labels(kind=lbl, key=key).set(max(delta, 0))
+    if start is not None:
+        MODEL_LOAD_SECONDS.labels(kind=lbl).observe(time.perf_counter() - start)
 
 # ───────── Loaders ─────────
 # Async-safe locks – protect first-time load from event-loop blocking and
@@ -377,10 +486,10 @@ async def load_align(lang: str):
         pair = A_CACHE.get(key)  # re-check inside lock
         if pair:
             return pair
-        before = free_mb(); _load_start("align", key)
+        before = free_mb(); t0 = _load_start("align", key)
         model, meta = await run_sync(
             whisperx.load_align_model, language_code=lang or "en", device=DEVICE)
-        A_CACHE.put(key, (model, meta)); _load_end("align", key, before)
+        A_CACHE.put(key, (model, meta)); _load_end("align", key, before, t0)
         return model, meta
 
 async def load_diar(model_name: str | None = None):
@@ -393,7 +502,7 @@ async def load_diar(model_name: str | None = None):
         pip = D_CACHE.get(diar_model_name)  # re-check inside lock
         if pip:
             return pip
-        before = free_mb(); _load_start("diarize", diar_model_name)
+        before = free_mb(); t0 = _load_start("diarize", diar_model_name)
         try:
             from whisperx.diarize import DiarizationPipeline as _DP
         except ImportError:
@@ -422,7 +531,7 @@ async def load_diar(model_name: str | None = None):
                 detail=(f"Diarization model '{diar_model_name}' is not cached locally and "
                         "LOCAL_ONLY_MODELS=1 prevents downloading.")
             ) from None
-        D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before)
+        D_CACHE.put(diar_model_name, pip); _load_end("diarize", diar_model_name, before, t0)
         return pip
 
 # ───────── Warmup ─────────
@@ -591,6 +700,7 @@ def _sweep_pools():
                 WHISPER_POOLS.pop(key, None)
                 pool.evict()
                 torch.cuda.empty_cache()
+                MODEL_EVICTIONS_TOTAL.labels(kind="whisper").inc()
                 logging.info("[whisper_pool_unload]  model=%s  size=%d  freeVRAM=%d MB",
                              pool.model_id, pool.size, free_mb())
 
@@ -617,6 +727,14 @@ def _transcribe_with_metrics(whisper, wav, transcribe_kw, model, audio_sec):
     AUDIO_SECONDS_TOTAL.labels(model=model).inc(audio_sec)
     return raw
 
+def _record_stage(stage: str, model: str, elapsed: float):
+    """Records a processing-stage's wall time (for the transcribe/align/diarize
+    share breakdown) and its estimated GPU cost (elapsed * GPU_HOURLY_COST_USD
+    / 3600; a no-op accumulation when GPU_HOURLY_COST_USD is 0)."""
+    PROCESS_STAGE_SECONDS.labels(stage=stage, model=model).observe(elapsed)
+    if GPU_HOURLY_COST_USD:
+        ESTIMATED_COST_USD_TOTAL.labels(stage=stage).inc(elapsed * GPU_HOURLY_COST_USD / 3600)
+
 async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_model_name: str | None):
     fname = Path(path).name
     ACTIVE_TRANSCRIPTIONS.inc()
@@ -629,6 +747,7 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
             raise HTTPException(status_code=400, detail=f"Error loading audio file: {e}")
 
         audio_sec = len(wav) / 16000
+        AUDIO_DURATION_SECONDS.observe(audio_sec)
         t0 = time.perf_counter()
 
         try:
@@ -651,7 +770,10 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
                     _log("transcribe_opts", fname, "lang=auto")
                 raw = await run_sync(_transcribe_with_metrics, whisper, wav, transcribe_kw, model, audio_sec)
             res = standardize(raw)
-            _log("transcribe_end", fname, "Δ=%.2fs", time.perf_counter() - t0)
+            transcribe_elapsed = time.perf_counter() - t0
+            _record_stage("transcribe", model, transcribe_elapsed)
+            LANGUAGE_DETECTED_TOTAL.labels(language=res.get("language") or lang or "unknown").inc()
+            _log("transcribe_end", fname, "Δ=%.2fs", transcribe_elapsed)
 
             # alignment
             if do_align:
@@ -660,7 +782,9 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
                 model_a, meta = await load_align(lang_used)
                 res = standardize(await run_sync(
                     whisperx.align, res["segments"], model_a, meta, wav, DEVICE))
-                _log("align_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+                align_elapsed = time.perf_counter() - t
+                _record_stage("align", model, align_elapsed)
+                _log("align_end", fname, "Δ=%.2fs", align_elapsed)
 
             # diarisation
             if do_diar:
@@ -669,7 +793,12 @@ async def process(path, model, lang, do_align, do_diar, trans_kw, diar_kw, diar_
                 spk = await run_sync(diar_pipe, wav, **diar_kw)
                 res = standardize(await run_sync(
                     whisperx.assign_word_speakers, spk, res), spk=True)
-                _log("diarize_end", fname, "Δ=%.2fs", time.perf_counter() - t)
+                diarize_elapsed = time.perf_counter() - t
+                _record_stage("diarize", model, diarize_elapsed)
+                num_speakers = len({s["speaker"] for s in res["segments"] if s.get("speaker")})
+                if num_speakers:
+                    NUM_SPEAKERS_DETECTED.observe(num_speakers)
+                _log("diarize_end", fname, "Δ=%.2fs", diarize_elapsed)
 
         except HTTPException:
             ERRORS_TOTAL.labels(stage="processing").inc()
@@ -759,7 +888,7 @@ def common_form_params(
 
 # ───────── Endpoints ─────────
 @contextlib.asynccontextmanager
-async def _track_request(endpoint: str, response_format):
+async def _track_request(endpoint: str, response_format, model: str = "unknown"):
     """Records whisperx_requests_total / whisperx_request_duration_seconds
     for one HTTP request, regardless of which response_format was chosen."""
     t0 = time.perf_counter()
@@ -774,7 +903,8 @@ async def _track_request(endpoint: str, response_format):
         raise
     finally:
         REQUEST_DURATION.labels(endpoint=endpoint).observe(time.perf_counter() - t0)
-        REQUESTS_TOTAL.labels(endpoint=endpoint, response_format=str(response_format), status=status).inc()
+        REQUESTS_TOTAL.labels(endpoint=endpoint, response_format=str(response_format),
+                              status=status, model=model).inc()
 
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
@@ -783,9 +913,11 @@ async def transcriptions(
     params: dict = Depends(common_form_params),
 ):
     """Transcribes an audio file."""
-    async with _track_request("transcriptions", params["response_format"]):
+    async with _track_request("transcriptions", params["response_format"], params["model"]):
         with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
-            tmp.write(await file.read())
+            data = await file.read()
+            UPLOAD_SIZE_BYTES.observe(len(data))
+            tmp.write(data)
             tmp.flush()
             # Sanitize language: treat empty strings or 'auto'/'detect' as None
             lang = (language or "").strip() or None
@@ -807,9 +939,11 @@ async def translations(
     params: dict = Depends(common_form_params),
 ):
     """Translates an audio file to English."""
-    async with _track_request("translations", params["response_format"]):
+    async with _track_request("translations", params["response_format"], params["model"]):
         with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
-            tmp.write(await file.read())
+            data = await file.read()
+            UPLOAD_SIZE_BYTES.observe(len(data))
+            tmp.write(data)
             tmp.flush()
             res = await process(
                 tmp.name, params["model"], None, params["align"], params["diarize"],

@@ -4,6 +4,43 @@ All notable changes to **WhisperX Transcription API** are documented in this fil
 
 ---
 
+## [1.13.0] – 2026-09-10
+### Added
+- Capacity, cost & stage-breakdown metrics:
+  - `whisperx_process_stage_seconds{stage,model}` – per-stage
+    (`transcribe`/`align`/`diarize`) wall time, for time-share breakdown.
+  - `whisperx_estimated_cost_usd_total{stage}` and
+    `whisperx_gpu_hourly_cost_usd` – estimated GPU cost from
+    `stage_wall_seconds * GPU_HOURLY_COST_USD / 3600` (new `GPU_HOURLY_COST_USD`
+    env var, defaults to `0` = disabled).
+  - `whisperx_executor_active_tasks` / `whisperx_executor_max_workers` –
+    shared-executor saturation (the real throughput ceiling across all
+    blocking work).
+  - `whisperx_model_pool_target_size` – configured max capacity per whisper
+    pool, for `% capacity used` calculations.
+- Cold-start & queueing visibility:
+  - `whisperx_model_load_seconds{kind}` / `whisperx_model_load_events_total{kind}` –
+    duration and count of actual model (re)loads per kind.
+  - `whisperx_model_vram_usage_mb{kind,key}` – VRAM delta of the most recent
+    load per model/language/diarization key.
+  - `whisperx_model_evictions_total{kind}` – TTL-based unload events.
+  - `whisperx_pool_wait_seconds{model}` – time spent waiting to acquire a
+    whisper instance from its pool.
+- Request/audio shape & quality signals:
+  - `whisperx_audio_duration_seconds`, `whisperx_upload_size_bytes` –
+    distribution of input duration and upload size.
+  - `whisperx_num_speakers_detected` – distribution of distinct diarized
+    speakers per request.
+  - `whisperx_language_detected_total{language}` – count by transcription
+    language.
+  - `model` label added to `whisperx_requests_total`.
+- Grafana dashboard (`grafana/whisperx-dashboard.json`) extended with a new
+  "Capacity, cost & stage breakdown" row (audio minutes/period, estimated
+  cost, cost per audio-minute, executor saturation %, stage time-share,
+  whisper pool utilization %).
+
+---
+
 ## [1.12.1] – 2026-09-09
 ### Fixed
 - Docker build was broken because the upstream base image

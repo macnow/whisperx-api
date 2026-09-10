@@ -35,3 +35,13 @@ scrape_configs:
   model.
 - **Model pools & errors** — loaded vs. idle whisper instances per model
   (`WHISPER_POOLS`); error rate by stage (`load_audio` / `processing`).
+- **Capacity, cost & stage breakdown** — audio minutes processed and
+  estimated GPU cost for the selected range (requires `GPU_HOURLY_COST_USD`),
+  cost per audio-minute, executor saturation %, per-stage
+  (transcribe/align/diarize) time-share, and whisper pool capacity
+  utilization % by model.
+- **Cold starts, queueing & audio quality** — model load duration (p95) and
+  load/eviction rate per kind (whisper/align/diarize), pool wait time (p95)
+  by model, median audio duration/upload size, median speakers detected,
+  and request rate by detected language.
+
